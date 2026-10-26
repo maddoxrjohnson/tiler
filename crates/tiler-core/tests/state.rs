@@ -631,7 +631,8 @@ fn resizing_a_window_across_the_monitor_edge_is_not_a_drop() {
 
 #[test]
 fn readme_config_example_is_valid() {
-    let readme = include_str!("../../../README.md");
+    // Windows checkouts may use CRLF line endings.
+    let readme = include_str!("../../../README.md").replace("\r\n", "\n");
     let start = readme.find("```toml\n").expect("README has a toml example") + "```toml\n".len();
     let end = start + readme[start..].find("```").expect("closed code block");
     let config = Config::from_toml(&readme[start..end]).unwrap_or_else(|e| panic!("{e}"));
