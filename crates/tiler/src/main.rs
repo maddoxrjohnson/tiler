@@ -1,7 +1,9 @@
-//! `tiler` — the server and (soon) the CLI client.
+//! `tiler`: the server, and the CLI that talks to it.
 
 #[cfg_attr(not(windows), allow(dead_code))]
 mod ipc;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod recovery;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod translate;
 
@@ -60,6 +62,23 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, String> {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // The server logs at info by default; CLI commands stay quiet unless asked.
+    let is_client = args
+        .first()
+        .is_some_and(|a| !matches!(a.as_str(), "server" | "--dry-run" | "--config"));
+    let default_level = if is_client { "warn" } else { "info" };
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("TILER_LOG")
+                .unwrap_or_else(|_| default_level.into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+    // Every command works in physical pixels. Without this, Windows virtualizes
+    // window and monitor coordinates for scaled displays while DWM still reports
+    // physical ones, and the two don't mix.
+    #[cfg(windows)]
+    enable_dpi_awareness();
     match args.first().map(String::as_str) {
         // `tiler` alone, or with only server options, starts the server.
         None | Some("server" | "--dry-run" | "--config") => {
@@ -80,6 +99,19 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Some(_) => run_client(&args),
+    }
+}
+
+#[cfg(windows)]
+fn enable_dpi_awareness() {
+    use windows::Win32::UI::HiDpi::{
+        SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+    };
+    // SAFETY: called once at startup, before any window is created.
+    if let Err(e) =
+        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
+    {
+        tracing::warn!(%e, "could not enable per-monitor DPI awareness");
     }
 }
 
@@ -110,9 +142,16 @@ fn run_client(args: &[String]) -> ExitCode {
             }
         }
         Err(client::ClientError::NotRunning) if args[0] == "rescue" => {
+            // Exact positions from a crashed server's recovery file first, then
+            // anything else that is stranded off-screen.
+            let recovered =
+                recovery::default_path().map_or(0, |p| recovery::restore::from_file(&p));
             let elevated = tiler_windows::win::window::is_process_elevated();
             let moved = tiler_windows::win::rescue::rescue_offscreen_windows(elevated);
-            println!("tiler server is not running; moved {moved} off-screen window(s) back");
+            println!(
+                "tiler server is not running; moved {} off-screen window(s) back",
+                recovered + moved
+            );
             ExitCode::SUCCESS
         }
         Err(client::ClientError::NotRunning) => {

@@ -88,10 +88,14 @@ fn next_instance() -> Instance {
     }
 }
 
+/// Blocks until a client connects to this instance.
+fn wait_for_client(instance: &Instance) {
+    // SAFETY: an already-connected client also counts as connected.
+    let _ = unsafe { ConnectNamedPipe(HANDLE(instance.0 as _), None) };
+}
+
 fn serve_one(instance: Instance, tx: &Sender<Incoming>) -> io::Result<()> {
     let handle = HANDLE(instance.0 as _);
-    // SAFETY: blocks until a client connects; an already-connected client is fine.
-    let _ = unsafe { ConnectNamedPipe(handle, None) };
     // SAFETY: we own the handle; File closes it when dropped.
     let mut pipe = unsafe { File::from_raw_handle(handle.0 as _) };
     let request: Request = read_message(&mut pipe)?;
@@ -120,9 +124,10 @@ fn serve_one(instance: Instance, tx: &Sender<Incoming>) -> io::Result<()> {
     flushed
 }
 
-/// Serves CLI clients one at a time. The next instance is always created before
-/// the current one is served, so the pipe name never disappears while the server
-/// runs (a client would otherwise think no server is running).
+/// Accepts CLI clients and serves each on its own short-lived thread, so a client
+/// that stalls only stalls itself. The next instance is always created before a
+/// client is handed off, so the pipe name never disappears while the server runs
+/// (a client would otherwise think no server is running).
 pub fn spawn_pipe_server(first: Instance, tx: Sender<Incoming>) {
     thread::Builder::new()
         .name("cli-pipe".into())
@@ -130,8 +135,17 @@ pub fn spawn_pipe_server(first: Instance, tx: Sender<Incoming>) {
             let mut current = first;
             loop {
                 let next = next_instance();
-                if let Err(e) = serve_one(current, &tx) {
-                    tracing::debug!(%e, "CLI client failed");
+                wait_for_client(&current);
+                let tx = tx.clone();
+                let spawned = thread::Builder::new()
+                    .name("cli-client".into())
+                    .spawn(move || {
+                        if let Err(e) = serve_one(current, &tx) {
+                            tracing::debug!(%e, "CLI client failed");
+                        }
+                    });
+                if let Err(e) = spawned {
+                    tracing::warn!(%e, "could not start a CLI client thread");
                 }
                 current = next;
             }

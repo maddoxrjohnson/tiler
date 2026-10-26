@@ -3,18 +3,25 @@
 
 use std::sync::OnceLock;
 use std::thread;
+use std::time::Duration;
 
-use crossbeam_channel::Sender;
+use crossbeam_channel::{Receiver, Sender};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
     TranslateMessage, MSG, SPI_SETWORKAREA, WINDOW_EX_STYLE, WM_DISPLAYCHANGE, WM_DPICHANGED,
-    WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
+    WM_ENDSESSION, WM_QUERYENDSESSION, WM_SETTINGCHANGE, WNDCLASSW, WS_OVERLAPPED,
 };
 
-static SENDER: OnceLock<Sender<()>> = OnceLock::new();
+struct Channels {
+    display: Sender<()>,
+    session_end: Sender<()>,
+    cleanup_done: Receiver<()>,
+}
+
+static CHANNELS: OnceLock<Channels> = OnceLock::new();
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Scaling changes on a monitor without the taskbar may not change any work
@@ -25,20 +32,44 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
         || msg == WM_DPICHANGED
         || (msg == WM_SETTINGCHANGE
             && (setting == SPI_SETWORKAREA.0 || setting == SPI_SETLOGICALDPIOVERRIDE));
+    let Some(ch) = CHANNELS.get() else {
+        // SAFETY: default handling.
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
+    };
     if relevant {
-        if let Some(tx) = SENDER.get() {
-            let _ = tx.send(());
-        }
+        let _ = ch.display.send(());
+    }
+    if msg == WM_QUERYENDSESSION {
+        return LRESULT(1);
+    }
+    // Logoff or shutdown: console handlers don't get these once user32 is loaded,
+    // so this is the last chance to put hidden windows back. Windows waits for
+    // this message to return (up to about 5 s).
+    if msg == WM_ENDSESSION && wparam.0 != 0 {
+        let _ = ch.session_end.send(());
+        let _ = ch.cleanup_done.recv_timeout(Duration::from_secs(4));
+        return LRESULT(0);
     }
     // SAFETY: default handling for everything else.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// Starts a thread with a hidden window that sends `()` whenever the monitor setup
-/// may have changed. Broadcasts like WM_DISPLAYCHANGE only reach top-level windows,
-/// so a message-only window would not work. Can only be called once.
-pub fn spawn_display_listener(tx: Sender<()>) {
-    if SENDER.set(tx).is_err() {
+/// Starts a thread with a hidden window that sends to `display` whenever the
+/// monitor setup may have changed, and to `session_end` when the user logs off or
+/// Windows shuts down; it then waits for `cleanup_done` before letting Windows
+/// continue. Broadcasts like WM_DISPLAYCHANGE only reach top-level windows, so a
+/// message-only window would not work. Can only be called once.
+pub fn spawn_display_listener(
+    display: Sender<()>,
+    session_end: Sender<()>,
+    cleanup_done: Receiver<()>,
+) {
+    let channels = Channels {
+        display,
+        session_end,
+        cleanup_done,
+    };
+    if CHANNELS.set(channels).is_err() {
         panic!("spawn_display_listener may only be called once");
     }
     thread::Builder::new()
