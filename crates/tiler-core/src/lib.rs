@@ -5,10 +5,12 @@
 //! layer should do. It never talks to the operating system, so it can be tested
 //! on any platform.
 
+pub mod command;
 pub mod geometry;
 pub mod tree;
 pub mod tree_ops;
 
+pub use command::{parse_args, parse_command, Command, LayoutArg, MonitorTarget, ParseError};
 pub use geometry::{Direction, MonitorId, Orientation, Rect, Sides, WindowId};
 pub use tree::{Container, InnerGaps, Layout, Node, Path};
 pub use tree_ops::{LayoutCmd, ResizeAmount, ResizeDim};
