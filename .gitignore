@@ -1,0 +1,22 @@
+# Build output
+/target/
+**/*.rs.bk
+
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+secrets.*
+
+# Local runtime state
+*.log
+tiler-state.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
