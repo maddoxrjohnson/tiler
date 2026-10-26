@@ -63,6 +63,14 @@ impl Rect {
     pub fn center(&self) -> (i32, i32) {
         (self.x + self.w / 2, self.y + self.h / 2)
     }
+
+    /// Whether the two rectangles share any area.
+    pub fn intersects(&self, other: &Rect) -> bool {
+        self.x < other.right()
+            && other.x < self.right()
+            && self.y < other.bottom()
+            && other.y < self.bottom()
+    }
 }
 
 /// The axis along which a container lays out its children.
@@ -142,6 +150,17 @@ mod tests {
         let r = Rect::new(10, 10, 5, 5).inset(Sides::all(10));
         assert_eq!(r.w, 0);
         assert_eq!(r.h, 0);
+    }
+
+    #[test]
+    fn intersects_requires_shared_area() {
+        let a = Rect::new(0, 0, 100, 100);
+        assert!(a.intersects(&Rect::new(50, 50, 100, 100)));
+        assert!(
+            !a.intersects(&Rect::new(100, 0, 10, 10)),
+            "touching edges share no area"
+        );
+        assert!(!a.intersects(&Rect::new(5000, 5000, 10, 10)));
     }
 
     #[test]

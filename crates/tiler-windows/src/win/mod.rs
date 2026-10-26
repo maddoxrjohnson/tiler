@@ -3,7 +3,9 @@
 
 pub mod apply;
 pub mod hook;
+pub mod keyboard;
 pub mod monitors;
+pub mod rescue;
 pub mod window;
 
 pub use window::Hwnd;
