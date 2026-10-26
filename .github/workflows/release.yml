@@ -1,0 +1,32 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --workspace
+      - run: cargo build --release
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "tiler-${{ github.ref_name }}-x86_64-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target\release\tiler.exe, README.md, LICENSE $name
+          Copy-Item crates\tiler-core\src\default-config.toml "$name\tiler.example.toml"
+          Compress-Archive $name "$name.zip"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create "${{ github.ref_name }}" "tiler-${{ github.ref_name }}-x86_64-windows.zip" `
+            --title "tiler ${{ github.ref_name }}" --generate-notes

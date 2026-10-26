@@ -628,3 +628,13 @@ fn resizing_a_window_across_the_monitor_edge_is_not_a_drop() {
         2
     );
 }
+
+#[test]
+fn readme_config_example_is_valid() {
+    let readme = include_str!("../../../README.md");
+    let start = readme.find("```toml\n").expect("README has a toml example") + "```toml\n".len();
+    let end = start + readme[start..].find("```").expect("closed code block");
+    let config = Config::from_toml(&readme[start..end]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(config.modes.contains_key("resize"));
+    assert_eq!(config.rules.len(), 2);
+}

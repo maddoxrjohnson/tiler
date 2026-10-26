@@ -22,3 +22,10 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 dbg_macro = "warn"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+# Keep unwinding: the panic hook restores hidden windows before tiler exits.
+panic = "unwind"
