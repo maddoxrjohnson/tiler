@@ -3,6 +3,7 @@
 
 pub mod apply;
 pub mod hook;
+pub mod identity;
 pub mod keyboard;
 pub mod monitors;
 pub mod rescue;

@@ -19,8 +19,12 @@ mod watch;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: tiler server [--dry-run] [--config PATH]
+const SERVER_USAGE: &str = "usage: tiler [server] [--dry-run] [--config PATH]";
+
+const USAGE: &str = "usage: tiler [server] [--dry-run] [--config PATH]
        tiler <command> [args...]
+
+With no command, tiler starts the server.
 
 Commands are the same as in the config file, e.g.
   tiler workspace 2          tiler focus left        tiler list-windows
@@ -48,7 +52,7 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, String> {
                 let path = args.next().ok_or("--config needs a path")?;
                 opts.config = Some(PathBuf::from(path));
             }
-            other => return Err(format!("unknown option '{other}'\n{USAGE}")),
+            other => return Err(format!("unknown option '{other}'\n{SERVER_USAGE}")),
         }
     }
     Ok(opts)
@@ -57,22 +61,25 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
-        Some("server") => match parse_server_options(&args[1..]) {
-            Ok(opts) => run_server(opts),
-            Err(e) => {
-                eprintln!("tiler: {e}");
-                ExitCode::from(2)
+        // `tiler` alone, or with only server options, starts the server.
+        None | Some("server" | "--dry-run" | "--config") => {
+            let options = match args.first().map(String::as_str) {
+                Some("server") => &args[1..],
+                _ => &args[..],
+            };
+            match parse_server_options(options) {
+                Ok(opts) => run_server(opts),
+                Err(e) => {
+                    eprintln!("tiler: {e}");
+                    ExitCode::from(2)
+                }
             }
-        },
+        }
         Some("help" | "--help" | "-h") => {
             println!("{}", usage());
             ExitCode::SUCCESS
         }
         Some(_) => run_client(&args),
-        None => {
-            eprintln!("{}", usage());
-            ExitCode::from(2)
-        }
     }
 }
 
@@ -103,7 +110,8 @@ fn run_client(args: &[String]) -> ExitCode {
             }
         }
         Err(client::ClientError::NotRunning) if args[0] == "rescue" => {
-            let moved = tiler_windows::win::rescue::rescue_offscreen_windows();
+            let elevated = tiler_windows::win::window::is_process_elevated();
+            let moved = tiler_windows::win::rescue::rescue_offscreen_windows(elevated);
             println!("tiler server is not running; moved {moved} off-screen window(s) back");
             ExitCode::SUCCESS
         }

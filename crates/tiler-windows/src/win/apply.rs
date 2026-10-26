@@ -117,14 +117,34 @@ pub fn set_rect(hwnd: Hwnd, visible: Rect) {
     }
 }
 
-/// Puts a window back on screen at `visible`, also when it is minimized: a
-/// minimized window remembers its restore position separately, and that position
-/// would otherwise still be the off-screen parking spot.
-pub fn restore_to(hwnd: Hwnd, visible: Rect) {
-    // SAFETY: plain query.
-    if !unsafe { IsIconic(hwnd.raw()) }.as_bool() {
-        set_rect(hwnd, visible);
-        return;
+/// Puts a window back on screen at `visible`, also when it is minimized or
+/// maximized: such a window remembers its restore position separately, and that
+/// position would otherwise still be the off-screen parking spot. Returns whether
+/// Windows accepted the change.
+pub fn restore_to(hwnd: Hwnd, visible: Rect) -> bool {
+    // SAFETY: plain queries.
+    let (minimized, maximized) = unsafe {
+        (
+            IsIconic(hwnd.raw()).as_bool(),
+            IsZoomed(hwnd.raw()).as_bool(),
+        )
+    };
+    if !minimized && !maximized {
+        let r = outer_rect(visible, window::borders(hwnd));
+        // SAFETY: synchronous here so the result says whether it worked; rescue is
+        // rare and user-initiated.
+        return unsafe {
+            SetWindowPos(
+                hwnd.raw(),
+                None,
+                r.x,
+                r.y,
+                r.w,
+                r.h,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            )
+        }
+        .is_ok();
     }
     let mut wp = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
@@ -133,17 +153,26 @@ pub fn restore_to(hwnd: Hwnd, visible: Rect) {
     // SAFETY: length is set; the struct outlives both calls.
     unsafe {
         if GetWindowPlacement(hwnd.raw(), &mut wp).is_err() {
-            return;
+            return false;
         }
-        wp.showCmd = SW_SHOWMINNOACTIVE.0 as u32;
+        // Keep minimized windows minimized; bring maximized ones back to normal.
+        wp.showCmd = if minimized {
+            SW_SHOWMINNOACTIVE.0 as u32
+        } else {
+            SW_SHOWNOACTIVATE.0 as u32
+        };
         wp.rcNormalPosition = RECT {
             left: visible.x,
             top: visible.y,
             right: visible.right(),
             bottom: visible.bottom(),
         };
-        if let Err(e) = SetWindowPlacement(hwnd.raw(), &wp) {
-            tracing::warn!(?hwnd, %e, "could not reset the restore position");
+        match SetWindowPlacement(hwnd.raw(), &wp) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(?hwnd, %e, "could not reset the restore position");
+                false
+            }
         }
     }
 }

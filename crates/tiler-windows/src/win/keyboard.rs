@@ -1,8 +1,7 @@
 //! The global keyboard hook that turns bound key chords into tiler commands.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use std::thread;
 
 use crossbeam_channel::Sender;
@@ -11,12 +10,12 @@ use windows::Win32::Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU, VK_RWIN, VK_SHIFT,
+    VIRTUAL_KEY, VK_CONTROL, VK_LCONTROL, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RMENU, VK_RWIN,
+    VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, SetWindowsHookExW, TranslateMessage, HC_ACTION,
-    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP,
+    KBDLLHOOKSTRUCT, LLKHF_INJECTED, MSG, WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
 };
 
 use crate::vk::{is_modifier, key_name};
@@ -31,16 +30,19 @@ struct Shared {
 
 static SHARED: OnceLock<Shared> = OnceLock::new();
 
-/// Set after swallowing a chord that held Alt or Win, so releasing that modifier
-/// doesn't open the app's menu bar or the Start menu.
-static MASK_MODIFIER_RELEASE: AtomicBool = AtomicBool::new(false);
-
-/// An unassigned virtual key, pressed to "use" a held Alt or Win key.
+/// An unassigned virtual key, pressed while Alt or Win is held so that releasing the
+/// modifier later doesn't open the app's menu bar or the Start menu.
 const VK_MASK: u16 = 0xE8;
 
 fn held(vk: VIRTUAL_KEY) -> bool {
     // SAFETY: plain query.
     (unsafe { GetAsyncKeyState(i32::from(vk.0)) }) < 0
+}
+
+/// AltGr on non-US layouts arrives as left Ctrl + right Alt. Those characters
+/// (e.g. `@` on German keyboards) must never trigger a ctrl-alt binding.
+fn altgr_held() -> bool {
+    held(VK_RMENU) && held(VK_LCONTROL) && !held(VK_RCONTROL)
 }
 
 fn current_mods() -> Mods {
@@ -83,7 +85,7 @@ fn handle(msg: u32, vk: u32) -> bool {
         return false;
     };
     if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-        if is_modifier(vk) {
+        if is_modifier(vk) || altgr_held() {
             return false;
         }
         let Some(key) = key_name(vk).and_then(|k| k.parse().ok()) else {
@@ -96,20 +98,17 @@ fn handle(msg: u32, vk: u32) -> bool {
         let bound = shared
             .bindings
             .read()
-            .map(|b| b.contains(&chord))
-            .unwrap_or(false);
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&chord);
         if bound {
+            // Inject the mask key now, while the modifier is still down, so the shell
+            // sees "Win, E8, ..." whatever order the keys are released in.
             if chord.mods.contains(Mods::ALT) || chord.mods.contains(Mods::WIN) {
-                MASK_MODIFIER_RELEASE.store(true, Ordering::Relaxed);
+                press_mask_key();
             }
             let _ = shared.tx.send(chord);
             return true;
         }
-    } else if (msg == WM_KEYUP || msg == WM_SYSKEYUP)
-        && matches!(vk, 0x12 | 0xA4 | 0xA5 | 0x5B | 0x5C)
-        && MASK_MODIFIER_RELEASE.swap(false, Ordering::Relaxed)
-    {
-        press_mask_key();
     }
     false
 }

@@ -42,8 +42,11 @@ pub fn rescue_target(
     normal: Option<tiler_core::Rect>,
     monitors: &[tiler_core::Rect],
     area: tiler_core::Rect,
+    we_are_elevated: bool,
 ) -> Option<tiler_core::Rect> {
-    if !crate::facts::manageable(facts, true) {
+    // Elevated windows can't be moved by a non-elevated process, so they are only
+    // candidates when we can actually move them.
+    if !crate::facts::manageable(facts, we_are_elevated) {
         return None;
     }
     let current = if facts.minimized { normal? } else { facts.rect };
@@ -81,7 +84,7 @@ mod rescue_tests {
     fn parked_app_window_is_rescued_with_its_size() {
         let f = app(Rect::new(2340, 1500, 800, 600));
         assert_eq!(
-            rescue_target(&f, None, &[SCREEN], AREA),
+            rescue_target(&f, None, &[SCREEN], AREA, false),
             Some(Rect::new(40, 40, 800, 600))
         );
     }
@@ -89,7 +92,13 @@ mod rescue_tests {
     #[test]
     fn on_screen_windows_are_left_alone() {
         assert_eq!(
-            rescue_target(&app(Rect::new(100, 100, 800, 600)), None, &[SCREEN], AREA),
+            rescue_target(
+                &app(Rect::new(100, 100, 800, 600)),
+                None,
+                &[SCREEN],
+                AREA,
+                false
+            ),
             None
         );
     }
@@ -102,13 +111,26 @@ mod rescue_tests {
             ..app(Rect::new(-31991, -32000, 219, 30))
         };
         let on_screen_restore = Some(Rect::new(420, 200, 1400, 900));
-        assert_eq!(rescue_target(&f, on_screen_restore, &[SCREEN], AREA), None);
+        assert_eq!(
+            rescue_target(&f, on_screen_restore, &[SCREEN], AREA, false),
+            None
+        );
         let parked_restore = Some(Rect::new(2340, 1500, 1400, 900));
         assert_eq!(
-            rescue_target(&f, parked_restore, &[SCREEN], AREA),
+            rescue_target(&f, parked_restore, &[SCREEN], AREA, false),
             Some(Rect::new(40, 40, 1400, 900))
         );
-        assert_eq!(rescue_target(&f, None, &[SCREEN], AREA), None);
+        assert_eq!(rescue_target(&f, None, &[SCREEN], AREA, false), None);
+    }
+
+    #[test]
+    fn elevated_windows_only_when_we_can_move_them() {
+        let f = WindowFacts {
+            elevated: true,
+            ..app(Rect::new(2340, 1500, 800, 600))
+        };
+        assert_eq!(rescue_target(&f, None, &[SCREEN], AREA, false), None);
+        assert!(rescue_target(&f, None, &[SCREEN], AREA, true).is_some());
     }
 
     #[test]
@@ -117,8 +139,8 @@ mod rescue_tests {
             ex_style: WS_EX_TOOLWINDOW,
             ..app(Rect::new(62, -588, 458, 65))
         };
-        assert_eq!(rescue_target(&popup, None, &[SCREEN], AREA), None);
+        assert_eq!(rescue_target(&popup, None, &[SCREEN], AREA, false), None);
         let zero = app(Rect::new(0, 0, 0, 0));
-        assert_eq!(rescue_target(&zero, None, &[SCREEN], AREA), None);
+        assert_eq!(rescue_target(&zero, None, &[SCREEN], AREA, false), None);
     }
 }

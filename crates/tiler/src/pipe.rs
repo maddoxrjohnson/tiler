@@ -4,9 +4,10 @@ use std::fs::File;
 use std::io;
 use std::os::windows::io::FromRawHandle;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Sender};
+use crossbeam_channel::{bounded, Receiver, Sender};
+use tiler_windows::win::identity::{self, OwnerOnly};
 use windows::core::HSTRING;
 use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
@@ -15,52 +16,94 @@ use windows::Win32::System::Pipes::{
     PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
 };
 
-use crate::ipc::{pipe_name, read_message, write_message, Request, Response};
-
-/// A CLI request and where to send its response.
-pub type Incoming = (Request, Sender<Response>);
+use crate::ipc::{read_message, write_message, Request, Response};
 
 /// How long a client waits for the server loop to answer.
-const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn create_instance(first: bool) -> io::Result<HANDLE> {
+/// A CLI request, where to send its response, and when the client stops waiting.
+pub struct Incoming {
+    pub request: Request,
+    pub reply: Sender<Response>,
+    /// Requests still queued after this were already answered with a timeout and
+    /// must not run.
+    pub deadline: Instant,
+    /// Fires once the response has been written to the client.
+    pub written: Receiver<()>,
+}
+
+/// This user's pipe name in this session.
+pub fn name() -> String {
+    let sid = identity::user_sid().unwrap_or_else(|| "unknown".into());
+    crate::ipc::pipe_name(&sid, identity::session_id())
+}
+
+/// A listening pipe instance.
+pub struct Instance(isize);
+
+fn create_instance(first: bool) -> io::Result<Instance> {
     let mut open_mode = PIPE_ACCESS_DUPLEX;
     if first {
         open_mode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
     }
-    // SAFETY: plain call with a valid, owned name string.
+    // Only this user may connect, even when the server runs elevated.
+    let security = identity::user_sid().and_then(|sid| OwnerOnly::new(&sid));
+    // SAFETY: valid name; the security attributes outlive the call.
     let handle = unsafe {
         CreateNamedPipeW(
-            &HSTRING::from(pipe_name()),
+            &HSTRING::from(name()),
             open_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             64 * 1024,
             64 * 1024,
             0,
-            None,
+            security.as_ref().map(|s| &s.attributes as *const _),
         )
     };
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    Ok(handle)
+    Ok(Instance(handle.0 as isize))
 }
 
 /// Claims the pipe name. Fails if another tiler server already owns it, which makes
 /// this the single-instance check.
-pub fn claim() -> io::Result<HANDLE> {
+pub fn claim() -> io::Result<Instance> {
     create_instance(true)
 }
 
-fn serve_one(handle: HANDLE, tx: &Sender<Incoming>) -> io::Result<()> {
+/// Creates the next instance, retrying so a transient failure doesn't end the CLI.
+fn next_instance() -> Instance {
+    let mut delay = Duration::from_millis(100);
+    loop {
+        match create_instance(false) {
+            Ok(i) => return i,
+            Err(e) => {
+                tracing::warn!(%e, "could not create a CLI pipe instance; retrying");
+                thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_secs(5));
+            }
+        }
+    }
+}
+
+fn serve_one(instance: Instance, tx: &Sender<Incoming>) -> io::Result<()> {
+    let handle = HANDLE(instance.0 as _);
     // SAFETY: blocks until a client connects; an already-connected client is fine.
     let _ = unsafe { ConnectNamedPipe(handle, None) };
     // SAFETY: we own the handle; File closes it when dropped.
     let mut pipe = unsafe { File::from_raw_handle(handle.0 as _) };
     let request: Request = read_message(&mut pipe)?;
     let (reply_tx, reply_rx) = bounded(1);
-    let response = match tx.send((request, reply_tx)) {
+    let (written_tx, written_rx): (Sender<()>, Receiver<()>) = bounded(1);
+    let incoming = Incoming {
+        request,
+        reply: reply_tx,
+        deadline: Instant::now() + ANSWER_TIMEOUT,
+        written: written_rx,
+    };
+    let response = match tx.send(incoming) {
         Ok(()) => reply_rx.recv_timeout(ANSWER_TIMEOUT).unwrap_or(Response {
             ok: false,
             output: "the server did not answer in time".into(),
@@ -72,27 +115,25 @@ fn serve_one(handle: HANDLE, tx: &Sender<Incoming>) -> io::Result<()> {
     };
     write_message(&mut pipe, &response)?;
     // Wait until the client has read everything before the handle is closed.
-    pipe.sync_all()
+    let flushed = pipe.sync_all();
+    let _ = written_tx.send(());
+    flushed
 }
 
-/// Serves CLI clients one at a time, starting with the instance from [`claim`].
-pub fn spawn_pipe_server(first: HANDLE, tx: Sender<Incoming>) {
-    let first = first.0 as isize;
+/// Serves CLI clients one at a time. The next instance is always created before
+/// the current one is served, so the pipe name never disappears while the server
+/// runs (a client would otherwise think no server is running).
+pub fn spawn_pipe_server(first: Instance, tx: Sender<Incoming>) {
     thread::Builder::new()
         .name("cli-pipe".into())
         .spawn(move || {
-            let mut handle = HANDLE(first as _);
+            let mut current = first;
             loop {
-                if let Err(e) = serve_one(handle, &tx) {
+                let next = next_instance();
+                if let Err(e) = serve_one(current, &tx) {
                     tracing::debug!(%e, "CLI client failed");
                 }
-                handle = match create_instance(false) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        tracing::error!(%e, "CLI pipe stopped");
-                        return;
-                    }
-                };
+                current = next;
             }
         })
         .expect("failed to spawn the CLI pipe thread");

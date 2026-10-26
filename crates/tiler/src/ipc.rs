@@ -22,10 +22,11 @@ pub struct Response {
     pub output: String,
 }
 
-/// The pipe of the current user's server, so users on the same machine don't collide.
-pub fn pipe_name() -> String {
-    let user = std::env::var("USERNAME").unwrap_or_else(|_| "default".into());
-    format!(r"\\.\pipe\tiler-{user}")
+/// The pipe of one user's server in one Windows session. Keyed by SID (not user
+/// name) so another user can't claim it, and by session so a console and a remote
+/// desktop session of the same user don't collide.
+pub fn pipe_name(user_sid: &str, session: u32) -> String {
+    format!(r"\\.\pipe\tiler-{user_sid}-{session}")
 }
 
 pub fn write_message<T: Serialize>(w: &mut impl Write, msg: &T) -> io::Result<()> {
@@ -60,6 +61,15 @@ pub fn read_message<T: DeserializeOwned>(r: &mut impl Read) -> io::Result<T> {
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn pipe_name_is_per_user_and_session() {
+        assert_eq!(
+            pipe_name("S-1-5-21-1-2-3-1001", 1),
+            r"\\.\pipe\tiler-S-1-5-21-1-2-3-1001-1"
+        );
+        assert_ne!(pipe_name("S-1", 1), pipe_name("S-1", 2));
+    }
 
     #[test]
     fn round_trip() {

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, unbounded};
 use tiler_core::{parse_args, Action, Config, Event, Monitor, Rect, State};
@@ -134,7 +134,7 @@ impl Server {
             Action::ReloadConfig => self.reload_config(),
             Action::Rescue => {
                 self.restore_hidden();
-                let moved = rescue::rescue_offscreen_windows();
+                let moved = rescue::rescue_offscreen_windows(self.we_are_elevated);
                 self.output
                     .push(Ok(format!("moved {moved} off-screen window(s) back")));
             }
@@ -166,16 +166,17 @@ impl Server {
             self.hide.show(hwnd);
             if let (Some(area), Some(r)) = (area, window::visible_rect(hwnd)) {
                 let rect = Rect::new(area.x + 40, area.y + 40, r.w.min(area.w), r.h.min(area.h));
-                apply::restore_to(hwnd, rect);
+                let _ = apply::restore_to(hwnd, rect);
             }
         }
     }
 
     fn refresh_bindings(&mut self) {
         let chords: HashSet<_> = self.state.bindings().bindings.keys().copied().collect();
-        if let Ok(mut b) = self.bindings.write() {
-            *b = chords;
-        }
+        *self
+            .bindings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = chords;
     }
 
     /// Runs a CLI command. Returns the response and whether to keep running.
@@ -330,6 +331,7 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     }
     tracing::info!("tiler is running; stop it with `tiler quit` or Ctrl-C");
 
+    let mut quit_reply = None;
     loop {
         let timeout = if server.replace_soon.is_empty() {
             Duration::from_secs(3600)
@@ -349,10 +351,17 @@ pub fn run(opts: ServerOptions) -> ExitCode {
                 Err(_) => break,
             },
             recv(cli_rx) -> incoming => match incoming {
-                Ok((request, reply)) => {
-                    let (response, keep_running) = server.on_request(request);
-                    let _ = reply.send(response);
-                    if !keep_running { break }
+                // The client was already told it timed out; don't run it late.
+                Ok(incoming) if Instant::now() > incoming.deadline => {}
+                Ok(incoming) => {
+                    let (response, keep_running) = server.on_request(incoming.request);
+                    if keep_running {
+                        let _ = incoming.reply.send(response);
+                    } else {
+                        // Answer `quit` after cleanup, so "ok" means it is done.
+                        quit_reply = Some((response, incoming.reply, incoming.written));
+                        break;
+                    }
                 }
                 Err(_) => break,
             },
@@ -365,6 +374,11 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     tracing::info!("stopping; restoring hidden windows");
     if !server.dry_run {
         server.restore_hidden();
+    }
+    if let Some((response, reply, written)) = quit_reply {
+        let _ = reply.send(response);
+        // Let the pipe thread deliver the reply before the process exits.
+        let _ = written.recv_timeout(Duration::from_secs(2));
     }
     let _ = cleanup_done.send(());
     ExitCode::SUCCESS
