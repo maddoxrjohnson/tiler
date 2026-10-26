@@ -7,10 +7,12 @@
 pub mod facts;
 pub mod frame;
 pub mod offscreen;
+pub mod vk;
 
 #[cfg(windows)]
 pub mod win;
 
 pub use facts::{float_hint, manageable, WindowFacts};
 pub use frame::{outer_rect, Borders};
-pub use offscreen::offscreen_origin;
+pub use offscreen::{offscreen_origin, rescue_target};
+pub use vk::{is_modifier, key_name};

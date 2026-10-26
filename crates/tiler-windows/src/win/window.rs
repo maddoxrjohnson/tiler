@@ -14,8 +14,9 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowRect, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, GW_OWNER,
+    EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE,
+    GW_OWNER, WINDOWPLACEMENT,
 };
 
 use crate::facts::WindowFacts;
@@ -87,6 +88,17 @@ pub fn visible_rect(hwnd: Hwnd) -> Option<Rect> {
         Ok(()) => Some(rect_from(r)),
         Err(_) => outer_rect(hwnd),
     }
+}
+
+/// Where the window goes when restored from minimized or maximized.
+pub fn normal_rect(hwnd: Hwnd) -> Option<Rect> {
+    let mut wp = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: length is set and the struct outlives the call.
+    unsafe { GetWindowPlacement(hwnd.raw(), &mut wp) }.ok()?;
+    Some(rect_from(wp.rcNormalPosition))
 }
 
 pub fn borders(hwnd: Hwnd) -> Borders {

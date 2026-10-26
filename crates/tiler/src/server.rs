@@ -1,14 +1,16 @@
 //! The tiler server: receives window events, runs the core, applies its actions.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{select, unbounded};
-use tiler_core::{Action, Config, Event, Monitor, Rect, State};
+use tiler_core::{parse_args, Action, Config, Event, Monitor, Rect, State};
 use tiler_windows::win::apply::{self, HideStrategy, OffscreenHide};
 use tiler_windows::win::hook::{self, RawEvent};
+use tiler_windows::win::keyboard::{self, Bindings};
+use tiler_windows::win::rescue;
 use tiler_windows::win::{monitors, window, Hwnd};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -16,7 +18,10 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::console;
+use crate::ipc::{Request, Response};
+use crate::pipe;
 use crate::translate::{self, Context, Kind};
+use crate::watch;
 use crate::ServerOptions;
 
 /// How long to wait before placing a just-unmaximized window again, once its
@@ -66,6 +71,10 @@ struct Server {
     config_explicit: bool,
     /// Windows that were maximized when placed, with their target rect.
     replace_soon: HashMap<Hwnd, Rect>,
+    /// The chords the keyboard hook swallows: the current mode's bindings.
+    bindings: Bindings,
+    /// Replies and errors produced while handling the current CLI request.
+    output: Vec<Result<String, String>>,
 }
 
 impl Server {
@@ -90,6 +99,17 @@ impl Server {
     }
 
     fn execute(&mut self, action: Action) -> bool {
+        match &action {
+            Action::Reply(text) => self.output.push(Ok(text.clone())),
+            Action::Error(text) => self.output.push(Err(text.clone())),
+            Action::ModeChanged(_) => self.refresh_bindings(),
+            // Read-only, so it also runs in a dry run.
+            Action::DebugWindows => {
+                debug_windows();
+                return true;
+            }
+            _ => {}
+        }
         if self.dry_run {
             tracing::info!(?action, "dry run");
             return !matches!(action, Action::Quit);
@@ -112,8 +132,13 @@ impl Server {
             Action::Error(text) => tracing::warn!("{text}"),
             Action::ModeChanged(mode) => tracing::info!(%mode, "mode"),
             Action::ReloadConfig => self.reload_config(),
-            Action::Rescue => self.restore_hidden(),
-            Action::DebugWindows => debug_windows(),
+            Action::Rescue => {
+                self.restore_hidden();
+                let moved = rescue::rescue_offscreen_windows(self.we_are_elevated);
+                self.output
+                    .push(Ok(format!("moved {moved} off-screen window(s) back")));
+            }
+            Action::DebugWindows => {}
             Action::Quit => return false,
         }
         true
@@ -141,9 +166,48 @@ impl Server {
             self.hide.show(hwnd);
             if let (Some(area), Some(r)) = (area, window::visible_rect(hwnd)) {
                 let rect = Rect::new(area.x + 40, area.y + 40, r.w.min(area.w), r.h.min(area.h));
-                apply::restore_to(hwnd, rect);
+                let _ = apply::restore_to(hwnd, rect);
             }
         }
+    }
+
+    fn refresh_bindings(&mut self) {
+        let chords: HashSet<_> = self.state.bindings().bindings.keys().copied().collect();
+        *self
+            .bindings
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = chords;
+    }
+
+    /// Runs a CLI command. Returns the response and whether to keep running.
+    fn on_request(&mut self, request: Request) -> (Response, bool) {
+        let command = match parse_args(&request.args) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    Response {
+                        ok: false,
+                        output: e.to_string(),
+                    },
+                    true,
+                )
+            }
+        };
+        self.output.clear();
+        let keep_running = self.dispatch(Event::Command(command));
+        let output = std::mem::take(&mut self.output);
+        let ok = output.iter().all(Result::is_ok);
+        let text: Vec<String> = output
+            .into_iter()
+            .map(|r| r.unwrap_or_else(|e| e))
+            .collect();
+        (
+            Response {
+                ok,
+                output: text.join("\n"),
+            },
+            keep_running,
+        )
     }
 
     /// Places windows that were maximized again, now that they are restored.
@@ -210,6 +274,15 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         }
     };
 
+    // Claim the CLI pipe first: it doubles as the single-instance check.
+    let pipe_handle = match pipe::claim() {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("tiler: could not start (is another tiler server running?): {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     let mut server = Server {
         state: State::new(config),
         hide: Box::new(OffscreenHide::default()),
@@ -219,7 +292,10 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         config_path,
         config_explicit,
         replace_soon: HashMap::new(),
+        bindings: Bindings::default(),
+        output: Vec::new(),
     };
+    server.refresh_bindings();
     if server.dry_run {
         tracing::info!("dry run: no window will be moved");
     }
@@ -241,8 +317,21 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     // SAFETY: plain query.
     let foreground = Hwnd::from(unsafe { GetForegroundWindow() });
     server.dispatch(Event::WindowFocused(foreground.id()));
-    tracing::info!("tiler is running; press Ctrl-C to stop");
+    let (cli_tx, cli_rx) = unbounded();
+    pipe::spawn_pipe_server(pipe_handle, cli_tx);
+    let (hotkey_tx, hotkey_rx) = unbounded();
+    if server.dry_run {
+        tracing::info!("dry run: hotkeys are disabled so no keys are swallowed");
+    } else {
+        keyboard::spawn_keyboard_hook(server.bindings.clone(), hotkey_tx);
+    }
+    let (config_tx, config_rx) = unbounded();
+    if let Some(path) = server.config_path.clone() {
+        watch::spawn_config_watcher(path, config_tx);
+    }
+    tracing::info!("tiler is running; stop it with `tiler quit` or Ctrl-C");
 
+    let mut quit_reply = None;
     loop {
         let timeout = if server.replace_soon.is_empty() {
             Duration::from_secs(3600)
@@ -254,6 +343,29 @@ pub fn run(opts: ServerOptions) -> ExitCode {
                 Ok(raw) => if !server.on_raw(raw) { break },
                 Err(_) => break,
             },
+            recv(hotkey_rx) -> chord => match chord {
+                Ok(chord) => {
+                    server.output.clear();
+                    if !server.dispatch(Event::Hotkey(chord)) { break }
+                }
+                Err(_) => break,
+            },
+            recv(cli_rx) -> incoming => match incoming {
+                // The client was already told it timed out; don't run it late.
+                Ok(incoming) if Instant::now() > incoming.deadline => {}
+                Ok(incoming) => {
+                    let (response, keep_running) = server.on_request(incoming.request);
+                    if keep_running {
+                        let _ = incoming.reply.send(response);
+                    } else {
+                        // Answer `quit` after cleanup, so "ok" means it is done.
+                        quit_reply = Some((response, incoming.reply, incoming.written));
+                        break;
+                    }
+                }
+                Err(_) => break,
+            },
+            recv(config_rx) -> _ => server.reload_config(),
             recv(stop_rx) -> _ => break,
             default(timeout) => server.replace_unmaximized(),
         }
@@ -262,6 +374,11 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     tracing::info!("stopping; restoring hidden windows");
     if !server.dry_run {
         server.restore_hidden();
+    }
+    if let Some((response, reply, written)) = quit_reply {
+        let _ = reply.send(response);
+        // Let the pipe thread deliver the reply before the process exits.
+        let _ = written.recv_timeout(Duration::from_secs(2));
     }
     let _ = cleanup_done.send(());
     ExitCode::SUCCESS
