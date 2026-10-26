@@ -210,9 +210,15 @@ fn process_info(hwnd: Hwnd) -> (String, bool) {
     (exe, token_elevated(handle.0).unwrap_or(true))
 }
 
-/// Everything the heuristics need, or `None` if the window is gone.
+/// Everything the heuristics need, or `None` if the window is gone or invisible.
+/// Invisible windows are rejected first because they are common and the process
+/// lookup below costs several system calls.
 pub fn facts(hwnd: Hwnd) -> Option<WindowFacts> {
     let h = hwnd.raw();
+    // SAFETY: plain query.
+    if !unsafe { IsWindowVisible(h) }.as_bool() {
+        return None;
+    }
     let rect = visible_rect(hwnd)?;
     // SAFETY: these read-only queries accept any hwnd and fail softly.
     let (style, ex_style, has_owner, visible, minimized) = unsafe {

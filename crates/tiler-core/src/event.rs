@@ -23,13 +23,15 @@ pub struct WindowInfo {
 }
 
 /// A display, with the area not covered by the taskbar.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Monitor {
     pub id: MonitorId,
     /// The whole display.
     pub bounds: Rect,
     /// The display minus the taskbar and other app bars.
     pub work_area: Rect,
+    /// DPI scale factor (1.0 = 96 DPI, 1.5 = 144 DPI). Gaps are multiplied by it.
+    pub scale: f32,
     pub name: String,
     pub primary: bool,
 }
@@ -47,6 +49,9 @@ pub enum Event {
     /// The user finished moving or resizing a window with the mouse.
     WindowMoveSizeEnd(WindowId, Rect),
     WindowTitleChanged(WindowId, String),
+    /// After being placed, the window turned out larger than asked: it has a minimum
+    /// size of `(width, height)`.
+    WindowMinSize(WindowId, i32, i32),
     /// The full, current set of monitors.
     MonitorsChanged(Vec<Monitor>),
     Command(Command),

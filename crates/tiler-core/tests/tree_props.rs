@@ -86,9 +86,13 @@ proptest! {
             let windows: BTreeSet<u64> = tree.windows().iter().map(|w| w.0).collect();
             prop_assert_eq!(&windows, &model);
 
-            let rects = tree.layout_rects(AREA, GAPS, 30);
-            prop_assert_eq!(rects.len(), model.len());
-            for (_, r) in rects {
+            let plain = tree.layout_rects(AREA, GAPS, 30);
+            // Arbitrary minimums, some impossible to satisfy together.
+            let min = |id: WindowId| ((id.0 as i32 * 97) % 900, (id.0 as i32 * 53) % 700);
+            let with_min = tree.layout_rects_with(AREA, GAPS, 30, &min);
+            prop_assert_eq!(plain.len(), model.len());
+            prop_assert_eq!(with_min.len(), model.len());
+            for (_, r) in plain.into_iter().chain(with_min) {
                 prop_assert!(r.w >= 0 && r.h >= 0, "negative size {:?}", r);
                 prop_assert!(r.x >= AREA.x && r.right() <= AREA.right(), "{:?} outside", r);
                 prop_assert!(r.y >= AREA.y && r.bottom() <= AREA.bottom(), "{:?} outside", r);

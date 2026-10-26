@@ -45,6 +45,7 @@ fn monitors() -> impl Strategy<Value = Vec<Monitor>> {
             .map(|i| Monitor {
                 id: MonitorId(i as u64 + 1),
                 bounds: Rect::new(i as i32 * 1920, 0, 1920, 1080),
+                scale: if i == 1 { 1.5 } else { 1.0 },
                 work_area: Rect::new(i as i32 * 1920, 0, 1920, if i == 2 { 1920 } else { 1080 }),
                 name: format!("M{i}"),
                 primary: i == 0,
@@ -65,7 +66,8 @@ fn event() -> impl Strategy<Value = Event> {
         2 => id.clone().prop_map(Event::WindowFocused),
         1 => id.clone().prop_map(Event::WindowMinimized),
         1 => id.clone().prop_map(Event::WindowRestored),
-        1 => (id, rect).prop_map(|(id, r)| Event::WindowMoveSizeEnd(id, r)),
+        1 => (id.clone(), rect).prop_map(|(id, r)| Event::WindowMoveSizeEnd(id, r)),
+        1 => (id, 0i32..3000, 0i32..2000).prop_map(|(id, w, h)| Event::WindowMinSize(id, w, h)),
         1 => monitors().prop_map(Event::MonitorsChanged),
         6 => prop::sample::select(COMMANDS).prop_map(|c| Event::Command(parse_command(c).unwrap())),
         2 => prop::sample::select(vec!["alt-1", "alt-2", "alt-h", "alt-shift-l", "l", "esc"])

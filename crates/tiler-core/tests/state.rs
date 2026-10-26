@@ -15,6 +15,7 @@ fn monitor(id: u64, x: i32) -> Monitor {
         id: MonitorId(id),
         bounds: Rect::new(x, 0, 1920, 1080),
         work_area: Rect::new(x, 0, 1920, 1080),
+        scale: 1.0,
         name: format!("Monitor {id}"),
         primary: id == 1,
     }
@@ -492,4 +493,138 @@ fn focus_from_a_floating_window_goes_to_the_tiles() {
 fn debug_windows_is_passed_to_the_platform() {
     let mut h = Harness::single();
     assert_eq!(h.cmd("debug-windows"), vec![Action::DebugWindows]);
+}
+
+#[test]
+fn a_window_that_will_not_shrink_gets_its_minimum_and_the_rest_adapts() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.open(2);
+    let a = h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    assert_eq!(
+        a,
+        vec![
+            set_rect(1, Rect::new(8, 8, 1200, 1064)),
+            set_rect(2, Rect::new(1216, 8, 696, 1064)),
+        ]
+    );
+    // A minimum that already fits changes nothing.
+    assert!(h.ev(Event::WindowMinSize(WindowId(2), 300, 0)).is_empty());
+    // Closing the stubborn window frees the space.
+    let a = h.ev(Event::WindowDestroyed(WindowId(1)));
+    assert!(a.contains(&set_rect(2, FULL)));
+}
+
+#[test]
+fn shrinking_a_window_by_mouse_lowers_its_minimum() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.open(2);
+    h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    // The user drags window 1 narrower than its recorded minimum: they know best.
+    let a = h.ev(Event::WindowMoveSizeEnd(
+        WindowId(1),
+        Rect::new(8, 8, 1000, 1064),
+    ));
+    assert!(
+        a.contains(&set_rect(1, Rect::new(8, 8, 1000, 1064))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn dragging_a_tiled_window_to_another_monitor_moves_it_there() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.open(1);
+    h.open(2);
+    let a = h.ev(Event::WindowMoveSizeEnd(
+        WindowId(2),
+        Rect::new(2500, 100, 948, 1064),
+    ));
+    assert_eq!(
+        a,
+        vec![
+            set_rect(1, FULL),
+            set_rect(2, Rect::new(1928, 8, 1904, 1064)),
+        ]
+    );
+    assert_eq!(reply(&h.cmd("list-workspaces --focused")), "2");
+}
+
+#[test]
+fn dragging_a_floating_window_to_another_monitor_keeps_it_where_dropped() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.ev(Event::WindowAppeared(
+        WindowId(5),
+        floating(Rect::new(100, 100, 800, 600)),
+    ));
+    let dropped = Rect::new(2200, 100, 800, 600);
+    assert!(h
+        .ev(Event::WindowMoveSizeEnd(WindowId(5), dropped))
+        .is_empty());
+    assert_eq!(
+        reply(&h.cmd("list-windows")),
+        "5 | 2 | tool.exe | tool.exe window"
+    );
+}
+
+#[test]
+fn gaps_scale_with_monitor_dpi() {
+    let mut m = monitor(1, 0);
+    m.scale = 1.5;
+    let mut h = Harness::new(Config::default(), vec![m]);
+    // Default outer gap 8 becomes 12 at 150%.
+    assert_eq!(h.open(1), vec![set_rect(1, Rect::new(12, 12, 1896, 1056))]);
+}
+
+#[test]
+fn balance_sizes_and_reload_clear_recorded_minimums() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.open(2);
+    h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    let a = h.cmd("balance-sizes");
+    assert!(a.contains(&set_rect(1, LEFT)), "{a:?}");
+    h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    let a = h.ev(Event::ConfigReloaded(Box::default()));
+    assert!(a.contains(&set_rect(1, LEFT)), "{a:?}");
+}
+
+#[test]
+fn minimums_keep_their_visual_size_across_monitor_dpi() {
+    let mut hi = monitor(1, 0);
+    hi.scale = 1.5;
+    let mut h = Harness::new(Config::default(), vec![hi, monitor(2, 1920)]);
+    h.open(1);
+    h.open(2);
+    // Measured on the 150% monitor: 1500 px there is 1000 px at 100%.
+    h.ev(Event::WindowMinSize(WindowId(1), 1500, 0));
+    let a = h.cmd("move-workspace-to-monitor next");
+    assert!(
+        a.contains(&set_rect(1, Rect::new(1928, 8, 1000, 1064))),
+        "{a:?}"
+    );
+    assert!(
+        a.contains(&set_rect(2, Rect::new(2936, 8, 896, 1064))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn resizing_a_window_across_the_monitor_edge_is_not_a_drop() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.open(1);
+    h.open(2);
+    // Window 1 widened far enough that its center ends up on monitor 2.
+    h.ev(Event::WindowMoveSizeEnd(
+        WindowId(1),
+        Rect::new(8, 8, 3900, 1064),
+    ));
+    assert_eq!(
+        reply(&h.cmd("list-windows"))
+            .lines()
+            .filter(|l| l.contains("| 1 |"))
+            .count(),
+        2
+    );
 }
