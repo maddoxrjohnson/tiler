@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use tiler_windows::win::identity::{self, OwnerOnly};
 use windows::core::HSTRING;
-use windows::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_DUPLEX};
 use windows::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
@@ -40,6 +40,22 @@ pub fn name() -> String {
 
 /// A listening pipe instance.
 pub struct Instance(isize);
+
+impl Instance {
+    /// Hands the handle to the caller, who becomes responsible for closing it.
+    fn into_handle(self) -> HANDLE {
+        let handle = HANDLE(self.0 as _);
+        std::mem::forget(self);
+        handle
+    }
+}
+
+impl Drop for Instance {
+    fn drop(&mut self) {
+        // SAFETY: we own the handle and nothing else has taken it.
+        let _ = unsafe { CloseHandle(HANDLE(self.0 as _)) };
+    }
+}
 
 fn create_instance(first: bool) -> io::Result<Instance> {
     let mut open_mode = PIPE_ACCESS_DUPLEX;
@@ -95,7 +111,7 @@ fn wait_for_client(instance: &Instance) {
 }
 
 fn serve_one(instance: Instance, tx: &Sender<Incoming>) -> io::Result<()> {
-    let handle = HANDLE(instance.0 as _);
+    let handle = instance.into_handle();
     // SAFETY: we own the handle; File closes it when dropped.
     let mut pipe = unsafe { File::from_raw_handle(handle.0 as _) };
     let request: Request = read_message(&mut pipe)?;

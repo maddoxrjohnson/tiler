@@ -266,7 +266,11 @@ pub fn facts(hwnd: Hwnd) -> Option<WindowFacts> {
         .then(|| uwp_app_window(hwnd))
         .flatten()
     {
-        Some(child) => process_info(child),
+        // If the app's process can't be read, the frame's own is better than
+        // nothing (an empty name would also be treated as elevated).
+        Some(child) => Some(process_info(child))
+            .filter(|(exe, _)| !exe.is_empty())
+            .unwrap_or_else(|| process_info(hwnd)),
         None => process_info(hwnd),
     };
     Some(WindowFacts {

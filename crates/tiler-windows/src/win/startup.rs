@@ -47,10 +47,10 @@ fn current_value(key: HKEY) -> Option<String> {
     Some(String::from_utf16_lossy(&buf[..chars.min(buf.len())]))
 }
 
-/// Registers or unregisters `"<this exe>" server` to run at login. Unregistering
-/// only removes the entry if it points at a tiler executable, so tiler never
-/// deletes someone else's value.
-pub fn set_start_at_login(enable: bool) {
+/// Registers or unregisters `"<this exe>" <args>` to run at login. Unregistering
+/// only removes the entry if it runs this very executable, so tiler never deletes
+/// someone else's value.
+pub fn set_start_at_login(enable: bool, args: &str) {
     let Some(key) = open_run_key() else {
         tracing::warn!("could not open the Run registry key");
         return;
@@ -58,7 +58,7 @@ pub fn set_start_at_login(enable: bool) {
     if enable {
         match std::env::current_exe() {
             Ok(exe) => {
-                let command = format!("\"{}\" server", exe.display());
+                let command = format!("\"{}\" {args}", exe.display());
                 let wide: Vec<u16> = command.encode_utf16().chain([0]).collect();
                 // SAFETY: REG_SZ data is the NUL-terminated UTF-16 string as bytes.
                 let bytes = unsafe {
@@ -73,9 +73,14 @@ pub fn set_start_at_login(enable: bool) {
             }
             Err(e) => tracing::warn!(%e, "could not find tiler's own path"),
         }
-    } else if current_value(key).is_some_and(|v| v.to_lowercase().contains("tiler")) {
-        // SAFETY: valid key and value name.
-        let _ = unsafe { RegDeleteValueW(key, &HSTRING::from(VALUE)) };
+    } else if let (Some(value), Ok(exe)) = (current_value(key), std::env::current_exe()) {
+        let ours = value
+            .to_lowercase()
+            .contains(&exe.display().to_string().to_lowercase());
+        if ours {
+            // SAFETY: valid key and value name.
+            let _ = unsafe { RegDeleteValueW(key, &HSTRING::from(VALUE)) };
+        }
     }
     // SAFETY: we opened this key above.
     let _ = unsafe { RegCloseKey(key) };

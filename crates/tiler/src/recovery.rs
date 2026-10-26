@@ -7,11 +7,14 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Parked {
     pub hwnd: i64,
     /// The visible frame before it was parked: x, y, width, height.
     pub rect: [i32; 4],
+    /// The owning executable, to recognise the window if its handle was reused.
+    #[serde(default)]
+    pub exe: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -64,6 +67,7 @@ mod tests {
             parked: vec![Parked {
                 hwnd: 0x1234,
                 rect: [8, 8, 948, 1064],
+                exe: "Code.exe".into(),
             }],
         };
         save(&path, &file).unwrap();
@@ -89,7 +93,7 @@ mod tests {
 pub mod restore {
     use std::sync::Mutex;
 
-    use tiler_core::Rect;
+    use tiler_core::{Monitor, Rect};
     use tiler_windows::win::{apply, monitors, window, Hwnd};
 
     use super::{Parked, RecoveryFile};
@@ -99,50 +103,93 @@ pub mod restore {
     static PARKED: Mutex<Vec<Parked>> = Mutex::new(Vec::new());
 
     pub fn mirror(parked: &[Parked]) {
-        if let Ok(mut p) = PARKED.lock() {
-            p.clear();
-            p.extend_from_slice(parked);
-        }
+        let mut p = PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        p.clear();
+        p.extend_from_slice(parked);
     }
 
     /// Restores every parked window recorded in memory. Used by the panic hook.
     pub fn restore_mirrored() -> usize {
-        let parked = PARKED.lock().map(|p| p.clone()).unwrap_or_default();
-        restore_all(&parked)
+        let parked = PARKED
+            .lock()
+            .map(|p| p.clone())
+            .unwrap_or_else(|e| e.into_inner().clone());
+        restore_ours(&parked)
     }
 
-    pub fn rect_of(p: &Parked) -> Rect {
+    fn rect_of(p: &Parked) -> Rect {
         Rect::new(p.rect[0], p.rect[1], p.rect[2], p.rect[3])
     }
 
-    /// Puts each window back where it was, if it still exists and is still off
-    /// screen. A rect that is no longer on any monitor goes to the primary one.
-    pub fn restore_all(parked: &[Parked]) -> usize {
+    /// Whether the middle of `r` is on one of the monitors (a sliver of overlap
+    /// doesn't make a window usable).
+    fn on_screen(monitors: &[Monitor], r: &Rect) -> bool {
+        let (cx, cy) = r.center();
+        monitors.iter().any(|m| {
+            let b = m.bounds;
+            (b.x..b.right()).contains(&cx) && (b.y..b.bottom()).contains(&cy)
+        })
+    }
+
+    /// Where a window should go back to: its saved rect, or the primary monitor if
+    /// that rect is no longer on any monitor.
+    fn target(monitors: &[Monitor], saved: Rect) -> Option<Rect> {
+        if on_screen(monitors, &saved) {
+            return Some(saved);
+        }
+        let primary = monitors.iter().find(|m| m.primary).or(monitors.first())?;
+        let a = primary.work_area;
+        Some(Rect::new(
+            a.x + 40,
+            a.y + 40,
+            saved.w.min(a.w),
+            saved.h.min(a.h),
+        ))
+    }
+
+    /// Restores windows this process parked. They are moved back unconditionally:
+    /// a park that is still queued (busy app) must not be mistaken for a window
+    /// that is already on screen. The moves are queued too, so they land after any
+    /// pending park instead of overtaking it.
+    pub fn restore_ours(parked: &[Parked]) -> usize {
         let monitors = monitors::monitors();
-        let Some(primary) = monitors.iter().find(|m| m.primary).or(monitors.first()) else {
-            return 0;
-        };
-        let on_screen = |r: &Rect| monitors.iter().any(|m| m.bounds.intersects(r));
         let mut restored = 0;
         for p in parked {
             let hwnd = Hwnd(p.hwnd as isize);
-            // Gone, or (if the handle was reused) a different window that is on
-            // screen: leave it alone.
-            let Some(now) = window::visible_rect(hwnd) else {
+            if window::visible_rect(hwnd).is_none() {
+                continue; // Closed.
+            }
+            if let Some(t) = target(&monitors, rect_of(p)) {
+                if apply::restore_to_queued(hwnd, t) {
+                    restored += 1;
+                }
+            }
+        }
+        restored
+    }
+
+    /// Restores windows listed by a server that did not exit cleanly. Since the
+    /// file may be old and window handles get reused, a window is only touched if
+    /// it is visible, not minimized, still off screen, and owned by the same
+    /// executable.
+    fn restore_from_file(parked: &[Parked]) -> usize {
+        let monitors = monitors::monitors();
+        let mut restored = 0;
+        for p in parked {
+            let hwnd = Hwnd(p.hwnd as isize);
+            let Some(f) = window::facts(hwnd) else {
                 continue;
             };
-            if on_screen(&now) {
+            let same_app = p.exe.is_empty() || f.process.eq_ignore_ascii_case(&p.exe);
+            if f.minimized || !same_app || on_screen(&monitors, &f.rect) {
                 continue;
             }
-            let saved = rect_of(p);
-            let target = if on_screen(&saved) {
-                saved
-            } else {
-                let a = primary.work_area;
-                Rect::new(a.x + 40, a.y + 40, saved.w.min(a.w), saved.h.min(a.h))
-            };
-            if apply::restore_to(hwnd, target) {
-                restored += 1;
+            if let Some(t) = target(&monitors, rect_of(p)) {
+                if apply::restore_to(hwnd, t) {
+                    restored += 1;
+                }
             }
         }
         restored
@@ -154,7 +201,7 @@ pub mod restore {
         let Some(RecoveryFile { parked, .. }) = super::load(path) else {
             return 0;
         };
-        let restored = restore_all(&parked);
+        let restored = restore_from_file(&parked);
         super::remove(path);
         restored
     }

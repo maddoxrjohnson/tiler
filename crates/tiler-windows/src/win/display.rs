@@ -1,6 +1,7 @@
 //! Noticing monitor changes: plugging a display in or out, changing resolution or
 //! scaling, or moving or auto-hiding the taskbar.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 use std::thread;
 use std::time::Duration;
@@ -23,6 +24,9 @@ struct Channels {
 
 static CHANNELS: OnceLock<Channels> = OnceLock::new();
 
+/// Set once the session-end cleanup has been started.
+static SESSION_ENDING: AtomicBool = AtomicBool::new(false);
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     // Scaling changes on a monitor without the taskbar may not change any work
     // area, so the DPI override setting counts too.
@@ -39,16 +43,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
     if relevant {
         let _ = ch.display.send(());
     }
-    if msg == WM_QUERYENDSESSION {
-        return LRESULT(1);
-    }
-    // Logoff or shutdown: console handlers don't get these once user32 is loaded,
-    // so this is the last chance to put hidden windows back. Windows waits for
-    // this message to return (up to about 5 s).
-    if msg == WM_ENDSESSION && wparam.0 != 0 {
-        let _ = ch.session_end.send(());
-        let _ = ch.cleanup_done.recv_timeout(Duration::from_secs(4));
-        return LRESULT(0);
+    // Logoff or shutdown. Console handlers don't get these once user32 is loaded,
+    // so this is the chance to put hidden windows back. Start at the query, before
+    // apps get WM_ENDSESSION and save their (parked) window positions. If the
+    // shutdown is then cancelled, tiler has stopped, but no window is lost.
+    // Windows waits for these messages to return (about 5 s).
+    if msg == WM_QUERYENDSESSION || (msg == WM_ENDSESSION && wparam.0 != 0) {
+        if !SESSION_ENDING.swap(true, Ordering::SeqCst) {
+            let _ = ch.session_end.send(());
+            let _ = ch.cleanup_done.recv_timeout(Duration::from_secs(4));
+        }
+        return LRESULT(if msg == WM_QUERYENDSESSION { 1 } else { 0 });
     }
     // SAFETY: default handling for everything else.
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }

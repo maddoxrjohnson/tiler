@@ -86,8 +86,8 @@ struct Server {
     verify_soon: HashMap<Hwnd, Verify>,
     /// When to re-read the monitors, after a burst of display change messages.
     display_at: Option<Instant>,
-    /// Where each hidden window was before it was hidden.
-    parked_rects: HashMap<Hwnd, Rect>,
+    /// Where each hidden (or about to be hidden) window was, and its executable.
+    parked_rects: HashMap<Hwnd, (Rect, String)>,
     /// What the recovery file currently says.
     saved_parked: Vec<Parked>,
     /// `None` in a dry run, which never parks anything.
@@ -113,6 +113,16 @@ impl Server {
         }
         tracing::debug!(?event, "event");
         let actions = self.state.handle(event);
+        // Record windows about to be hidden before any of them moves, so a crash
+        // or kill in between can never leave a parked window out of the record.
+        if !self.dry_run {
+            for action in &actions {
+                if let Action::Hide(id) = action {
+                    self.remember_before_hiding(Hwnd::from_id(*id));
+                }
+            }
+            self.save_recovery();
+        }
         let mut keep_running = true;
         for action in actions {
             keep_running &= self.execute(action);
@@ -121,19 +131,26 @@ impl Server {
         keep_running
     }
 
+    /// Notes where a window is and which app owns it, just before hiding it.
+    fn remember_before_hiding(&mut self, hwnd: Hwnd) {
+        if self.parked_rects.contains_key(&hwnd) {
+            return;
+        }
+        if let Some(f) = window::facts(hwnd) {
+            self.parked_rects.insert(hwnd, (f.rect, f.process));
+        }
+    }
+
     /// Writes the recovery file (and the panic hook's copy) when the set of parked
     /// windows changed.
     fn save_recovery(&mut self) {
         let mut parked: Vec<Parked> = self
-            .hide
-            .hidden()
-            .into_iter()
-            .filter_map(|h| {
-                let r = self.parked_rects.get(&h)?;
-                Some(Parked {
-                    hwnd: h.0 as i64,
-                    rect: [r.x, r.y, r.w, r.h],
-                })
+            .parked_rects
+            .iter()
+            .map(|(h, (r, exe))| Parked {
+                hwnd: h.0 as i64,
+                rect: [r.x, r.y, r.w, r.h],
+                exe: exe.clone(),
             })
             .collect();
         parked.sort_by_key(|p| p.hwnd);
@@ -196,16 +213,7 @@ impl Server {
                 }
                 apply::set_rect(hwnd, rect);
             }
-            Action::Hide(id) => {
-                let hwnd = Hwnd::from_id(id);
-                // Remember where it was, so recovery can put it back exactly.
-                if !self.hide.is_hidden(hwnd) {
-                    if let Some(r) = window::visible_rect(hwnd) {
-                        self.parked_rects.insert(hwnd, r);
-                    }
-                }
-                self.hide.hide(hwnd, &self.monitors);
-            }
+            Action::Hide(id) => self.hide.hide(Hwnd::from_id(id), &self.monitors),
             Action::Show(id) => {
                 let hwnd = Hwnd::from_id(id);
                 self.hide.show(hwnd);
@@ -230,9 +238,18 @@ impl Server {
     }
 
     fn apply_start_at_login(&self) {
-        if !self.dry_run {
-            startup::set_start_at_login(self.state.config().start_at_login);
+        if self.dry_run {
+            return;
         }
+        // Start in the background (no console window), with the same config file.
+        let mut args = String::from("server --background");
+        if self.config_explicit {
+            if let Some(path) = &self.config_path {
+                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                args.push_str(&format!(" --config \"{}\"", path.display()));
+            }
+        }
+        startup::set_start_at_login(self.state.config().start_at_login, &args);
     }
 
     fn reload_config(&mut self) {
@@ -246,7 +263,6 @@ impl Server {
         }
     }
 
-    /// Brings every window tiler hid back onto the primary monitor.
     /// Puts every window tiler hid back where it was when it was hidden.
     fn restore_hidden(&mut self) {
         let fallback = self
@@ -258,21 +274,23 @@ impl Server {
         for hwnd in self.hide.hidden() {
             self.hide.show(hwnd);
             match self.parked_rects.remove(&hwnd) {
-                Some(r) => {
+                Some((r, exe)) => {
                     let p = Parked {
                         hwnd: hwnd.0 as i64,
                         rect: [r.x, r.y, r.w, r.h],
+                        exe,
                     };
-                    recovery::restore::restore_all(&[p]);
+                    recovery::restore::restore_ours(&[p]);
                 }
                 None => {
                     if let (Some(a), Some(r)) = (fallback, window::visible_rect(hwnd)) {
                         let rect = Rect::new(a.x + 40, a.y + 40, r.w.min(a.w), r.h.min(a.h));
-                        let _ = apply::restore_to(hwnd, rect);
+                        let _ = apply::restore_to_queued(hwnd, rect);
                     }
                 }
             }
         }
+        self.parked_rects.clear();
         self.save_recovery();
     }
 
@@ -450,11 +468,21 @@ fn debug_windows() {
 }
 
 pub fn run(opts: ServerOptions) -> ExitCode {
+    if opts.background {
+        // Started at login: let go of the console window that Windows opened.
+        // SAFETY: plain call; logging already goes to a file.
+        let _ = unsafe { windows::Win32::System::Console::FreeConsole() };
+    }
+
     // If tiler panics, put parked windows back before the process goes away.
     let default_hook = std::panic::take_hook();
+    // Only the main thread's panic ends the server; a worker thread's panic must
+    // not bring hidden windows back while the server keeps running.
     std::panic::set_hook(Box::new(move |info| {
-        let restored = recovery::restore::restore_mirrored();
-        eprintln!("tiler crashed; restored {restored} hidden window(s)");
+        if std::thread::current().name() == Some("main") {
+            let restored = recovery::restore::restore_mirrored();
+            eprintln!("tiler crashed; restored {restored} hidden window(s)");
+        }
         default_hook(info);
     }));
 

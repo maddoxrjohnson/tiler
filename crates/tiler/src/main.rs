@@ -21,9 +21,9 @@ mod watch;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-const SERVER_USAGE: &str = "usage: tiler [server] [--dry-run] [--config PATH]";
+const SERVER_USAGE: &str = "usage: tiler [server] [--dry-run] [--background] [--config PATH]";
 
-const USAGE: &str = "usage: tiler [server] [--dry-run] [--config PATH]
+const USAGE: &str = "usage: tiler [server] [--dry-run] [--background] [--config PATH]
        tiler <command> [args...]
 
 With no command, tiler starts the server.
@@ -41,6 +41,9 @@ All commands: ";
 pub struct ServerOptions {
     /// Log the actions tiler would take instead of moving any window.
     pub dry_run: bool,
+    /// Detach from the console window and log to a file (used when starting at
+    /// login).
+    pub background: bool,
     pub config: Option<PathBuf>,
 }
 
@@ -50,6 +53,7 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, String> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--dry-run" => opts.dry_run = true,
+            "--background" => opts.background = true,
             "--config" => {
                 let path = args.next().ok_or("--config needs a path")?;
                 opts.config = Some(PathBuf::from(path));
@@ -63,17 +67,30 @@ fn parse_server_options(args: &[String]) -> Result<ServerOptions, String> {
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // The server logs at info by default; CLI commands stay quiet unless asked.
-    let is_client = args
-        .first()
-        .is_some_and(|a| !matches!(a.as_str(), "server" | "--dry-run" | "--config"));
-    let default_level = if is_client { "warn" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("TILER_LOG")
-                .unwrap_or_else(|_| default_level.into()),
+    let is_client = args.first().is_some_and(|a| {
+        !matches!(
+            a.as_str(),
+            "server" | "--dry-run" | "--background" | "--config"
         )
-        .with_writer(std::io::stderr)
-        .init();
+    });
+    let default_level = if is_client { "warn" } else { "info" };
+    let filter = tracing_subscriber::EnvFilter::try_from_env("TILER_LOG")
+        .unwrap_or_else(|_| default_level.into());
+    // In the background there is no console, so log to %LOCALAPPDATA%\tiler\tiler.log.
+    let log_file = (!is_client && args.iter().any(|a| a == "--background"))
+        .then(log_file)
+        .flatten();
+    match log_file {
+        Some(file) => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(file))
+            .init(),
+        None => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_writer(std::io::stderr)
+            .init(),
+    }
     // Every command works in physical pixels. Without this, Windows virtualizes
     // window and monitor coordinates for scaled displays while DWM still reports
     // physical ones, and the two don't mix.
@@ -81,7 +98,7 @@ fn main() -> ExitCode {
     enable_dpi_awareness();
     match args.first().map(String::as_str) {
         // `tiler` alone, or with only server options, starts the server.
-        None | Some("server" | "--dry-run" | "--config") => {
+        None | Some("server" | "--dry-run" | "--background" | "--config") => {
             let options = match args.first().map(String::as_str) {
                 Some("server") => &args[1..],
                 _ => &args[..],
@@ -100,6 +117,17 @@ fn main() -> ExitCode {
         }
         Some(_) => run_client(&args),
     }
+}
+
+/// The background log file, appended to.
+fn log_file() -> Option<std::fs::File> {
+    let dir = std::path::PathBuf::from(std::env::var_os("LOCALAPPDATA")?).join("tiler");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("tiler.log"))
+        .ok()
 }
 
 #[cfg(windows)]
