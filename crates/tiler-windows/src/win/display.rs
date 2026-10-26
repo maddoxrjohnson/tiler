@@ -17,9 +17,14 @@ use windows::Win32::UI::WindowsAndMessaging::{
 static SENDER: OnceLock<Sender<()>> = OnceLock::new();
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    // Scaling changes on a monitor without the taskbar may not change any work
+    // area, so the DPI override setting counts too.
+    const SPI_SETLOGICALDPIOVERRIDE: u32 = 0x009F;
+    let setting = wparam.0 as u32;
     let relevant = msg == WM_DISPLAYCHANGE
         || msg == WM_DPICHANGED
-        || (msg == WM_SETTINGCHANGE && wparam.0 as u32 == SPI_SETWORKAREA.0);
+        || (msg == WM_SETTINGCHANGE
+            && (setting == SPI_SETWORKAREA.0 || setting == SPI_SETLOGICALDPIOVERRIDE));
     if relevant {
         if let Some(tx) = SENDER.get() {
             let _ = tx.send(());

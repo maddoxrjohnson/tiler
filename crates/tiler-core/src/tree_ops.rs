@@ -220,6 +220,20 @@ impl Container {
         area: Rect,
         gaps: InnerGaps,
     ) -> bool {
+        self.resize_with(id, dim, amount, area, gaps, &|_| (0, 0))
+    }
+
+    /// [`resize`](Self::resize), starting from the sizes on screen given each
+    /// window's minimum size.
+    pub fn resize_with(
+        &mut self,
+        id: WindowId,
+        dim: ResizeDim,
+        amount: ResizeAmount,
+        area: Rect,
+        gaps: InnerGaps,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> bool {
         let Some(path) = self.find(id) else {
             return false;
         };
@@ -234,34 +248,31 @@ impl Container {
         }) else {
             return false;
         };
-        let rect = self.container_rect(&path[..k], area, gaps);
-        let parent = self.container_at_mut(&path[..k]);
-        let n = parent.children.len();
-        let (gap, length) = match orientation {
-            Orientation::H => (gaps.horizontal, rect.w),
-            Orientation::V => (gaps.vertical, rect.h),
-        };
-        let total = f64::from(length - gap * (n as i32 - 1));
-        if total <= 0.0 {
+        let Some((mut sizes, mins, total)) = self.sizes_at(&path[..k], area, gaps, min) else {
             return false;
-        }
+        };
+        let n = sizes.len();
         let i = path[k];
-        let sum: f64 = parent.weights.iter().sum();
-        let old = parent.weights[i];
-        let current = total * old / sum;
+        let current = sizes[i];
         let target = match amount {
             ResizeAmount::Relative(delta) => current + f64::from(delta),
             ResizeAmount::Absolute(size) => f64::from(size),
         };
-        let min = min_size(total, n);
-        // `.max(min)` guards against rounding when every child is at an equal share.
-        let target = target.clamp(min, (total - min * (n - 1) as f64).max(min));
-        let new = sum * target / total;
-        let scale = (sum - new) / (sum - old);
-        for (j, w) in parent.weights.iter_mut().enumerate() {
-            *w = if j == i { new } else { *w * scale };
+        let floor = min_size(total, n);
+        let low = floor.max(mins[i]);
+        // `.max(low)` guards against rounding when every child is at an equal share.
+        let target = target.clamp(low, (total - floor * (n - 1) as f64).max(low));
+        let others = total - current;
+        let scale = if others > 0.0 {
+            (total - target) / others
+        } else {
+            0.0
+        };
+        for (j, size) in sizes.iter_mut().enumerate() {
+            *size = if j == i { target } else { *size * scale };
         }
-        (new - old).abs() > f64::EPSILON
+        self.set_sizes(&path[..k], &sizes);
+        (target - current).abs() > f64::EPSILON
     }
 
     /// Moves one edge of a window by `delta` pixels (positive = outwards), taking the
@@ -275,6 +286,20 @@ impl Container {
         area: Rect,
         gaps: InnerGaps,
     ) -> bool {
+        self.resize_edge_with(id, side, delta, area, gaps, &|_| (0, 0))
+    }
+
+    /// [`resize_edge`](Self::resize_edge), starting from the sizes on screen given
+    /// each window's minimum size.
+    pub fn resize_edge_with(
+        &mut self,
+        id: WindowId,
+        side: Direction,
+        delta: i32,
+        area: Rect,
+        gaps: InnerGaps,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> bool {
         let Some(path) = self.find(id) else {
             return false;
         };
@@ -284,39 +309,72 @@ impl Container {
                 continue;
             }
             let i = path[k];
-            let n = parent.children.len();
-            let Some(j) = step(i, side, n) else {
+            let Some(j) = step(i, side, parent.children.len()) else {
                 continue;
             };
-            let rect = self.container_rect(&path[..k], area, gaps);
-            let (gap, length) = match side.orientation() {
-                Orientation::H => (gaps.horizontal, rect.w),
-                Orientation::V => (gaps.vertical, rect.h),
-            };
-            let total = f64::from(length - gap * (n as i32 - 1));
-            if total <= 0.0 {
+            let Some((mut sizes, mins, total)) = self.sizes_at(&path[..k], area, gaps, min) else {
                 return false;
-            }
-            let parent = self.container_at_mut(&path[..k]);
-            let sum: f64 = parent.weights.iter().sum();
-            let (wi, wj) = (parent.weights[i], parent.weights[j]);
-            let pair = total * (wi + wj) / sum;
-            let min = min_size(total, n);
-            let new_i = (total * wi / sum + f64::from(delta)).clamp(min, (pair - min).max(min));
-            parent.weights[i] = sum * new_i / total;
-            parent.weights[j] = sum * (pair - new_i) / total;
-            return (parent.weights[i] - wi).abs() > f64::EPSILON;
+            };
+            let floor = min_size(total, sizes.len());
+            let pair = sizes[i] + sizes[j];
+            let low = floor.max(mins[i]);
+            let high = (pair - floor.max(mins[j])).max(low);
+            let new_i = (sizes[i] + f64::from(delta)).clamp(low, high);
+            let changed = (new_i - sizes[i]).abs() > f64::EPSILON;
+            sizes[i] = new_i;
+            sizes[j] = pair - new_i;
+            self.set_sizes(&path[..k], &sizes);
+            return changed;
         }
         false
     }
 
+    /// The current sizes (as on screen), minimums, and available length of the tiles
+    /// container at `path`. `None` when it has no room at all.
+    fn sizes_at(
+        &self,
+        path: &[usize],
+        area: Rect,
+        gaps: InnerGaps,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> Option<(Vec<f64>, Vec<f64>, f64)> {
+        let rect = self.container_rect(path, area, gaps, min);
+        let c = self.container_at(path);
+        let n = c.children.len();
+        let (gap, length) = match c.orientation {
+            Orientation::H => (gaps.horizontal, rect.w),
+            Orientation::V => (gaps.vertical, rect.h),
+        };
+        let total = f64::from(length - gap * (n as i32 - 1));
+        if total <= 0.0 {
+            return None;
+        }
+        let mins = c.child_mins(gaps, 0, min);
+        Some((c.tile_sizes(total, &mins), mins, total))
+    }
+
+    /// Makes the weights of the container at `path` produce exactly `sizes`.
+    fn set_sizes(&mut self, path: &[usize], sizes: &[f64]) {
+        let c = self.container_at_mut(path);
+        for (w, size) in c.weights.iter_mut().zip(sizes) {
+            // Weights must stay positive; sizes are relative, so any scale works.
+            *w = size.max(1e-6);
+        }
+    }
+
     /// The rectangle of the container at `path` when the tree fills `area`. Accordion
     /// padding is ignored because only tiles containers are resized.
-    fn container_rect(&self, path: &[usize], area: Rect, gaps: InnerGaps) -> Rect {
+    fn container_rect(
+        &self,
+        path: &[usize],
+        area: Rect,
+        gaps: InnerGaps,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> Rect {
         let mut container = self;
         let mut rect = area;
         for &i in path {
-            rect = container.child_rects(rect, gaps, 0)[i];
+            rect = container.child_rects_with(rect, gaps, 0, min)[i];
             container = match &container.children[i] {
                 Node::Container(c) => c,
                 Node::Window(_) => unreachable!("path leads to a container"),
@@ -563,6 +621,27 @@ mod tests {
         assert!(t.resize_edge(id(3), Left, 100, area, InnerGaps::default()));
         let r = t.layout_rects(area, InnerGaps::default(), 0);
         assert_eq!(r[0].1.w, 400);
+    }
+
+    #[test]
+    fn resizing_starts_from_the_sizes_on_screen_when_minimums_apply() {
+        // Shown as 700/300 because window 1 can't be narrower than 700.
+        let mut t = root(h(vec![w(1), w(2)]));
+        let area = Rect::new(0, 0, 1000, 500);
+        let min = |id: WindowId| if id.0 == 1 { (700, 0) } else { (0, 0) };
+        assert!(t.resize_edge_with(id(1), Right, 100, area, InnerGaps::default(), &min));
+        let r = t.layout_rects_with(area, InnerGaps::default(), 0, &min);
+        assert_eq!((r[0].1.w, r[1].1.w), (800, 200));
+        assert!(t.resize_with(
+            id(2),
+            ResizeDim::Width,
+            ResizeAmount::Relative(100),
+            area,
+            InnerGaps::default(),
+            &min
+        ));
+        let r = t.layout_rects_with(area, InnerGaps::default(), 0, &min);
+        assert_eq!((r[0].1.w, r[1].1.w), (700, 300));
     }
 
     #[test]

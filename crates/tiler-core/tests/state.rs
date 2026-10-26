@@ -576,3 +576,55 @@ fn gaps_scale_with_monitor_dpi() {
     // Default outer gap 8 becomes 12 at 150%.
     assert_eq!(h.open(1), vec![set_rect(1, Rect::new(12, 12, 1896, 1056))]);
 }
+
+#[test]
+fn balance_sizes_and_reload_clear_recorded_minimums() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.open(2);
+    h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    let a = h.cmd("balance-sizes");
+    assert!(a.contains(&set_rect(1, LEFT)), "{a:?}");
+    h.ev(Event::WindowMinSize(WindowId(1), 1200, 0));
+    let a = h.ev(Event::ConfigReloaded(Box::default()));
+    assert!(a.contains(&set_rect(1, LEFT)), "{a:?}");
+}
+
+#[test]
+fn minimums_keep_their_visual_size_across_monitor_dpi() {
+    let mut hi = monitor(1, 0);
+    hi.scale = 1.5;
+    let mut h = Harness::new(Config::default(), vec![hi, monitor(2, 1920)]);
+    h.open(1);
+    h.open(2);
+    // Measured on the 150% monitor: 1500 px there is 1000 px at 100%.
+    h.ev(Event::WindowMinSize(WindowId(1), 1500, 0));
+    let a = h.cmd("move-workspace-to-monitor next");
+    assert!(
+        a.contains(&set_rect(1, Rect::new(1928, 8, 1000, 1064))),
+        "{a:?}"
+    );
+    assert!(
+        a.contains(&set_rect(2, Rect::new(2936, 8, 896, 1064))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn resizing_a_window_across_the_monitor_edge_is_not_a_drop() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.open(1);
+    h.open(2);
+    // Window 1 widened far enough that its center ends up on monitor 2.
+    h.ev(Event::WindowMoveSizeEnd(
+        WindowId(1),
+        Rect::new(8, 8, 3900, 1064),
+    ));
+    assert_eq!(
+        reply(&h.cmd("list-windows"))
+            .lines()
+            .filter(|l| l.contains("| 1 |"))
+            .count(),
+        2
+    );
+}

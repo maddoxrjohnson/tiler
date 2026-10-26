@@ -34,6 +34,9 @@ pub struct Container {
     pub weights: Vec<f64>,
 }
 
+/// The smallest share of a tiles container a child is ever given.
+pub(crate) const FLOOR_SHARE: f64 = 1.0 / 20.0;
+
 /// Indices from the root to a node. The last index is the node's position in its parent.
 pub type Path = Vec<usize>;
 
@@ -297,6 +300,7 @@ impl Container {
         out: &mut Vec<(WindowId, Rect)>,
     ) {
         let rects = self.child_rects_with(area, gaps, padding, min);
+        debug_assert_eq!(rects.len(), self.children.len());
         for (child, rect) in self.children.iter().zip(rects) {
             match child {
                 Node::Window(id) => out.push((*id, rect)),
@@ -310,6 +314,7 @@ impl Container {
         node: &Node,
         axis: Orientation,
         gaps: InnerGaps,
+        padding: i32,
         min: &dyn Fn(WindowId) -> (i32, i32),
     ) -> i32 {
         match node {
@@ -324,25 +329,49 @@ impl Container {
                 let mins = c
                     .children
                     .iter()
-                    .map(|n| Self::min_along(n, axis, gaps, min));
-                if c.orientation == axis && c.layout == Layout::Tiles {
-                    let gap = match axis {
-                        Orientation::H => gaps.horizontal,
-                        Orientation::V => gaps.vertical,
-                    };
-                    mins.sum::<i32>() + gap * (c.children.len() as i32 - 1).max(0)
-                } else {
-                    mins.max().unwrap_or(0)
+                    .map(|n| Self::min_along(n, axis, gaps, padding, min));
+                let n = c.children.len() as i32;
+                match (c.orientation == axis, c.layout) {
+                    (true, Layout::Tiles) => {
+                        let gap = match axis {
+                            Orientation::H => gaps.horizontal,
+                            Orientation::V => gaps.vertical,
+                        };
+                        mins.sum::<i32>() + gap * (n - 1).max(0)
+                    }
+                    // Accordion children are inset by the padding on up to two sides.
+                    (true, Layout::Accordion) => {
+                        mins.max().unwrap_or(0) + padding * (n - 1).clamp(0, 2)
+                    }
+                    (false, _) => mins.max().unwrap_or(0),
                 }
             }
         }
+    }
+
+    /// Each child's minimum size along this container's axis.
+    pub(crate) fn child_mins(
+        &self,
+        gaps: InnerGaps,
+        padding: i32,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> Vec<f64> {
+        self.children
+            .iter()
+            .map(|c| f64::from(Self::min_along(c, self.orientation, gaps, padding, min)))
+            .collect()
     }
 
     /// Sizes for tiles children: weighted shares, but no child below its minimum.
     /// Children whose share is too small are fixed at their minimum and the rest is
     /// shared again by weight. If even the minimums don't fit, they are scaled down
     /// proportionally.
-    fn tile_sizes(&self, avail: f64, mins: &[f64]) -> Vec<f64> {
+    pub(crate) fn tile_sizes(&self, avail: f64, mins: &[f64]) -> Vec<f64> {
+        // Every child keeps a small share, so windows without a known minimum still
+        // get room when the others' minimums overflow.
+        let floor = avail * FLOOR_SHARE;
+        let mins: Vec<f64> = mins.iter().map(|m| m.max(floor)).collect();
+        let mins = mins.as_slice();
         let total_min: f64 = mins.iter().sum();
         if total_min >= avail {
             return if total_min > 0.0 {
@@ -375,11 +404,7 @@ impl Container {
     }
 
     /// The rectangles of this container's direct children when it fills `area`.
-    pub(crate) fn child_rects(&self, area: Rect, gaps: InnerGaps, padding: i32) -> Vec<Rect> {
-        self.child_rects_with(area, gaps, padding, &|_| (0, 0))
-    }
-
-    fn child_rects_with(
+    pub(crate) fn child_rects_with(
         &self,
         area: Rect,
         gaps: InnerGaps,
@@ -398,11 +423,7 @@ impl Container {
                     Orientation::V => (gaps.vertical, area.h),
                 };
                 let avail = (total - gap * last as i32).max(0);
-                let mins: Vec<f64> = self
-                    .children
-                    .iter()
-                    .map(|c| f64::from(Self::min_along(c, self.orientation, gaps, min)))
-                    .collect();
+                let mins = self.child_mins(gaps, padding, min);
                 let sizes = self.tile_sizes(f64::from(avail), &mins);
                 let mut cumulative = 0.0;
                 let mut start = 0;
@@ -665,6 +686,35 @@ mod tests {
             widths_with(&t, 1000, &[(1, 700, 0), (2, 400, 0)]),
             vec![636, 364]
         );
+    }
+
+    #[test]
+    fn windows_without_a_minimum_keep_a_share_when_minimums_overflow() {
+        let t = root(h(vec![w(1), w(2), w(3)]));
+        let widths = widths_with(&t, 1000, &[(1, 700, 0), (2, 700, 0)]);
+        assert!(widths[2] > 0, "{widths:?}");
+        assert_eq!(widths.iter().sum::<i32>(), 1000);
+    }
+
+    #[test]
+    fn accordion_minimum_includes_its_padding() {
+        // H[1 V[2 HA[3 4]]]: window 3 needs 600 px but the accordion insets it by
+        // 30 px, so the V column must be at least 630 wide.
+        let mut acc = Container::with_children(Orientation::H, vec![w(3), w(4)]);
+        acc.layout = Layout::Accordion;
+        let column = Node::Container(Container::with_children(
+            Orientation::V,
+            vec![w(2), Node::Container(acc)],
+        ));
+        let t = root(h(vec![w(1), column]));
+        let r = t.layout_rects_with(
+            Rect::new(0, 0, 1000, 1000),
+            InnerGaps::default(),
+            30,
+            &|id: WindowId| if id.0 == 3 { (600, 0) } else { (0, 0) },
+        );
+        let w3 = r.iter().find(|(id, _)| id.0 == 3).unwrap().1.w;
+        assert_eq!(w3, 600, "{r:?}");
     }
 
     #[test]

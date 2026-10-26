@@ -55,7 +55,9 @@ pub struct State {
     /// focus event is ignored. Any other focus event clears it.
     suppress_hidden_focus: bool,
     /// Sizes below which a window refuses to shrink, as reported by the platform.
-    min_size: HashMap<WindowId, (i32, i32)>,
+    /// In DPI-independent units (pixels at 100% scale), so a window keeps the same
+    /// visual minimum on monitors with different scaling.
+    min_size: HashMap<WindowId, (f32, f32)>,
     /// Workspaces shown on monitors that went away, keyed by monitor name and
     /// position, so they come back when the monitor does (possibly with a new id).
     departed: Vec<(String, (i32, i32), String)>,
@@ -99,9 +101,10 @@ impl State {
                 }
             }
             Event::WindowMinSize(id, w, h) => {
-                if self.windows.contains_key(&id) {
+                if let Some(win) = self.windows.get(&id) {
+                    let scale = self.workspace_scale(&win.workspace.clone());
                     let min = self.min_size.entry(id).or_default();
-                    *min = (min.0.max(w), min.1.max(h));
+                    *min = (min.0.max(w as f32 / scale), min.1.max(h as f32 / scale));
                 }
             }
             Event::MonitorsChanged(monitors) => self.on_monitors_changed(monitors),
@@ -114,6 +117,8 @@ impl State {
             }
             Event::ConfigReloaded(config) => {
                 self.config = *config;
+                // A reload is also the escape hatch for minimums recorded wrongly.
+                self.min_size.clear();
                 if !self.config.modes.contains_key(&self.mode) {
                     self.mode = "main".into();
                 }
@@ -287,6 +292,12 @@ impl State {
                 (a.x..a.right()).contains(&cx) && (a.y..a.bottom()).contains(&cy)
             })
             .map(|m| m.id);
+        // Only a pure move is a drop: a resize can also push the center across.
+        let moved_only = match self.applied.get(&id) {
+            Some(Placement::At(old)) => (old.w, old.h) == (rect.w, rect.h),
+            _ => true,
+        };
+        let dropped_on = dropped_on.filter(|_| moved_only);
         if let Some(m) = dropped_on.filter(|m| Some(*m) != self.monitor_showing(&name)) {
             if let Some(target) = self.visible.get(&m).cloned() {
                 self.move_node(id, &target);
@@ -309,8 +320,12 @@ impl State {
         }
         // The user made the window smaller than its recorded minimum, so the
         // minimum was too high.
+        let scale = self.workspace_scale(&name);
         if let Some(min) = self.min_size.get_mut(&id) {
-            *min = (min.0.min(rect.w), min.1.min(rect.h));
+            *min = (
+                min.0.min(rect.w as f32 / scale),
+                min.1.min(rect.h as f32 / scale),
+            );
         }
         if let (Some(Placement::At(old)), Some(area)) =
             (self.applied.get(&id).copied(), self.workspace_area(&name))
@@ -327,10 +342,12 @@ impl State {
                 edges.push((Direction::Down, rect.bottom() - old.bottom()));
             }
             let gaps = self.workspace_gaps(&name);
+            let mins = self.workspace_mins(&name);
+            let min = |w: WindowId| mins.get(&w).copied().unwrap_or((0, 0));
             let root = &mut self.workspace_mut(&name).root;
             for (side, delta) in edges {
                 if delta != 0 {
-                    root.resize_edge(id, side, delta, area, gaps);
+                    root.resize_edge_with(id, side, delta, area, gaps, &min);
                 }
             }
         }
@@ -438,15 +455,23 @@ impl State {
                 if let Some((name, id)) = self.focused_tiled() {
                     if let Some(area) = self.workspace_area(&name) {
                         let gaps = self.workspace_gaps(&name);
+                        let mins = self.workspace_mins(&name);
+                        let min = |w: WindowId| mins.get(&w).copied().unwrap_or((0, 0));
                         self.workspace_mut(&name)
                             .root
-                            .resize(id, dim, amount, area, gaps);
+                            .resize_with(id, dim, amount, area, gaps, &min);
                     }
                 }
             }
             Command::BalanceSizes => {
                 if let Some(name) = self.focused_workspace().map(str::to_owned) {
-                    self.workspace_mut(&name).root.balance();
+                    let ws = self.workspace_mut(&name);
+                    ws.root.balance();
+                    // Also forget minimums: a way out if one was recorded wrongly.
+                    let ids: Vec<WindowId> = ws.windows().collect();
+                    for id in ids {
+                        self.min_size.remove(&id);
+                    }
                 }
             }
             Command::FlattenWorkspaceTree => {
@@ -688,6 +713,27 @@ impl State {
         Some(m.work_area.inset(self.scaled_gaps(m).0))
     }
 
+    /// The DPI scale of the monitor showing a workspace (1.0 when hidden).
+    fn workspace_scale(&self, name: &str) -> f32 {
+        self.monitor_showing(name)
+            .and_then(|m| self.monitor(m))
+            .map_or(1.0, |m| m.scale)
+    }
+
+    /// Minimum sizes of a workspace's windows in that monitor's pixels.
+    fn workspace_mins(&self, name: &str) -> HashMap<WindowId, (i32, i32)> {
+        let scale = self.workspace_scale(name);
+        self.min_size
+            .iter()
+            .map(|(id, &(w, h))| {
+                (
+                    *id,
+                    ((w * scale).round() as i32, (h * scale).round() as i32),
+                )
+            })
+            .collect()
+    }
+
     /// The inner gaps of the monitor showing a workspace.
     fn workspace_gaps(&self, name: &str) -> InnerGaps {
         self.monitor_showing(name)
@@ -871,7 +917,14 @@ impl State {
             };
             let (outer, inner, padding) = self.scaled_gaps(monitor);
             let area = monitor.work_area.inset(outer);
-            let min = |id: WindowId| self.min_size.get(&id).copied().unwrap_or((0, 0));
+            let min = |id: WindowId| {
+                self.min_size.get(&id).map_or((0, 0), |&(w, h)| {
+                    (
+                        (w * monitor.scale).round() as i32,
+                        (h * monitor.scale).round() as i32,
+                    )
+                })
+            };
             let tiled = ws.root.layout_rects_with(area, inner, padding, &min);
             for (id, rect) in tiled {
                 out.insert(id, Placement::At(rect));

@@ -64,6 +64,15 @@ fn load_config(path: Option<&PathBuf>, explicit: bool) -> Result<Config, String>
     }
 }
 
+/// A pending check of a window's size after placing it.
+#[derive(Debug, Clone, Copy)]
+struct Verify {
+    asked: Rect,
+    due: Instant,
+    /// The window was already too big once and has been placed again.
+    second_look: bool,
+}
+
 struct Server {
     state: State,
     hide: Box<dyn HideStrategy>,
@@ -72,12 +81,11 @@ struct Server {
     we_are_elevated: bool,
     config_path: Option<PathBuf>,
     config_explicit: bool,
-    /// Windows that were maximized when placed, with their target rect.
-    replace_soon: HashMap<Hwnd, Rect>,
+    /// Windows that were maximized when placed: target rect and when to place them
+    /// again (after the asynchronous restore).
+    replace_soon: HashMap<Hwnd, (Rect, Instant)>,
     /// Windows just placed, to check whether they accepted the size.
-    verify_soon: HashMap<Hwnd, Rect>,
-    /// When to re-place `replace_soon` and check `verify_soon`.
-    timer_at: Option<Instant>,
+    verify_soon: HashMap<Hwnd, Verify>,
     /// When to re-read the monitors, after a burst of display change messages.
     display_at: Option<Instant>,
     /// The chords the keyboard hook swallows: the current mode's bindings.
@@ -127,15 +135,22 @@ impl Server {
         match action {
             Action::SetRect(id, rect) => {
                 let hwnd = Hwnd::from_id(id);
+                let due = Instant::now() + REPLACE_DELAY;
                 if apply::is_maximized(hwnd) {
                     apply::unmaximize(hwnd);
-                    self.replace_soon.insert(hwnd, rect);
+                    self.replace_soon.insert(hwnd, (rect, due));
+                    self.verify_soon.remove(&hwnd);
                 } else {
-                    self.verify_soon.insert(hwnd, rect);
+                    self.verify_soon.insert(
+                        hwnd,
+                        Verify {
+                            asked: rect,
+                            due,
+                            second_look: false,
+                        },
+                    );
                 }
                 apply::set_rect(hwnd, rect);
-                self.timer_at
-                    .get_or_insert_with(|| Instant::now() + REPLACE_DELAY);
             }
             Action::Hide(id) => self.hide.hide(Hwnd::from_id(id), &self.monitors),
             Action::Show(id) => self.hide.show(Hwnd::from_id(id)),
@@ -226,21 +241,50 @@ impl Server {
     /// Runs the delayed work whose time has come.
     fn run_timers(&mut self) {
         let now = Instant::now();
-        if self.timer_at.is_some_and(|t| t <= now) {
-            self.timer_at = None;
-            self.verify_sizes();
-            // Windows that were maximized are restored by now: place them again with
-            // their normal borders, and check their size after that.
-            for (hwnd, rect) in std::mem::take(&mut self.replace_soon) {
-                apply::set_rect(hwnd, rect);
-                self.verify_soon.insert(hwnd, rect);
-                self.timer_at = Some(now + REPLACE_DELAY);
-            }
+
+        // Windows that were maximized are restored by now: place them again with
+        // their normal borders, and check their size after that.
+        let due: Vec<(Hwnd, Rect)> = self
+            .replace_soon
+            .iter()
+            .filter(|(_, (_, at))| *at <= now)
+            .map(|(h, (r, _))| (*h, *r))
+            .collect();
+        for (hwnd, rect) in due {
+            self.replace_soon.remove(&hwnd);
+            apply::set_rect(hwnd, rect);
+            self.verify_soon.insert(
+                hwnd,
+                Verify {
+                    asked: rect,
+                    due: now + REPLACE_DELAY,
+                    second_look: false,
+                },
+            );
         }
+
+        let due: Vec<(Hwnd, Verify)> = self
+            .verify_soon
+            .iter()
+            .filter(|(_, v)| v.due <= now)
+            .map(|(h, v)| (*h, *v))
+            .collect();
+        for (hwnd, v) in due {
+            self.verify_soon.remove(&hwnd);
+            self.verify_size(hwnd, v, now);
+        }
+
         if self.display_at.is_some_and(|t| t <= now) {
             self.display_at = None;
+            let monitors = monitors::monitors();
+            if monitors.is_empty() {
+                // Mid-reconfiguration; parking with no monitors would put hidden
+                // windows on screen. Try again shortly.
+                self.display_at = Some(now + DISPLAY_SETTLE);
+                return;
+            }
             tracing::info!("monitor setup changed");
-            self.dispatch(Event::MonitorsChanged(monitors::monitors()));
+            self.dispatch(Event::MonitorsChanged(monitors));
             // The parking spot depends on the monitor layout; a new monitor could
             // now be showing parked windows.
             for hwnd in self.hide.hidden() {
@@ -251,29 +295,53 @@ impl Server {
 
     /// The next time `run_timers` has something to do.
     fn next_timer(&self) -> Option<Instant> {
-        match (self.timer_at, self.display_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        self.replace_soon
+            .values()
+            .map(|(_, at)| *at)
+            .chain(self.verify_soon.values().map(|v| v.due))
+            .chain(self.display_at)
+            .min()
     }
 
-    /// Reports windows that ended up bigger than asked: apps with a minimum size.
-    fn verify_sizes(&mut self) {
-        for (hwnd, asked) in std::mem::take(&mut self.verify_soon) {
-            if self.hide.is_hidden(hwnd) {
-                continue;
-            }
-            let Some(actual) = window::visible_rect(hwnd) else {
-                continue;
-            };
-            // A few pixels of slack: some apps round their size.
-            let w = if actual.w > asked.w + 4 { actual.w } else { 0 };
-            let h = if actual.h > asked.h + 4 { actual.h } else { 0 };
-            if w > 0 || h > 0 {
-                tracing::debug!(?hwnd, w, h, "window has a minimum size");
-                self.dispatch(Event::WindowMinSize(hwnd.id(), w, h));
-            }
+    /// Checks whether a window accepted the size it was given. A window that is
+    /// bigger is placed again and looked at once more: it may simply not have
+    /// processed the move yet, or may have resized itself (DPI change, restoring
+    /// its saved size). Only a second refusal is recorded as a minimum size.
+    fn verify_size(&mut self, hwnd: Hwnd, v: Verify, now: Instant) {
+        if self.hide.is_hidden(hwnd) {
+            return;
         }
+        let Some(actual) = window::visible_rect(hwnd) else {
+            return;
+        };
+        // A few pixels of slack: some apps round their size.
+        let w = if actual.w > v.asked.w + 4 {
+            actual.w
+        } else {
+            0
+        };
+        let h = if actual.h > v.asked.h + 4 {
+            actual.h
+        } else {
+            0
+        };
+        if w == 0 && h == 0 {
+            return;
+        }
+        if !v.second_look {
+            apply::set_rect(hwnd, v.asked);
+            self.verify_soon.insert(
+                hwnd,
+                Verify {
+                    second_look: true,
+                    due: now + REPLACE_DELAY,
+                    ..v
+                },
+            );
+            return;
+        }
+        tracing::debug!(?hwnd, w, h, "window has a minimum size");
+        self.dispatch(Event::WindowMinSize(hwnd.id(), w, h));
     }
 
     fn on_raw(&mut self, raw: RawEvent) -> bool {
@@ -353,7 +421,6 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         config_explicit,
         replace_soon: HashMap::new(),
         verify_soon: HashMap::new(),
-        timer_at: None,
         display_at: None,
         bindings: Bindings::default(),
         output: Vec::new(),
