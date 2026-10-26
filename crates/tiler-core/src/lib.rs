@@ -6,11 +6,17 @@
 //! on any platform.
 
 pub mod command;
+pub mod config;
+pub mod event;
 pub mod geometry;
+pub mod keys;
 pub mod tree;
 pub mod tree_ops;
 
 pub use command::{parse_args, parse_command, Command, LayoutArg, MonitorTarget, ParseError};
+pub use config::{Config, ConfigError, Mode, MonitorPattern, RuleAction, WindowRule};
+pub use event::WindowInfo;
 pub use geometry::{Direction, MonitorId, Orientation, Rect, Sides, WindowId};
+pub use keys::{Key, KeyChord, Mods};
 pub use tree::{Container, InnerGaps, Layout, Node, Path};
 pub use tree_ops::{LayoutCmd, ResizeAmount, ResizeDim};
