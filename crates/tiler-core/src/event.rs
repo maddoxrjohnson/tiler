@@ -69,6 +69,9 @@ pub enum Action {
     Error(String),
     ReloadConfig,
     Rescue,
+    DebugWindows,
     Quit,
+    /// The binding mode changed, or the config was reloaded; the keyboard hook must
+    /// re-read [`State::bindings`](crate::State::bindings).
     ModeChanged(String),
 }

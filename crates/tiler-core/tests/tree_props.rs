@@ -37,7 +37,7 @@ fn resize_dim() -> impl Strategy<Value = ResizeDim> {
 }
 
 fn op() -> impl Strategy<Value = Op> {
-    let id = 0u64..12;
+    let id = 0u64..25;
     prop_oneof![
         3 => (id.clone(), id.clone()).prop_map(|(a, b)| Op::Insert(a, b)),
         1 => id.clone().prop_map(Op::Remove),

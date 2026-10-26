@@ -17,6 +17,8 @@ pub const DEFAULT_CONFIG: &str = include_str!("default-config.toml");
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Read by the platform layer to register or remove the login task.
+    pub start_at_login: bool,
     pub hide_strategy: HideStrategyKind,
     pub accordion_padding: i32,
     pub default_root_layout: Layout,
@@ -115,6 +117,12 @@ impl Config {
             ],
         )?;
 
+        let accordion_padding = raw.accordion_padding.unwrap_or(30);
+        if accordion_padding < 0 {
+            return Err(ConfigError(
+                "accordion-padding: must not be negative".into(),
+            ));
+        }
         let gaps = raw.gaps.unwrap_or_default();
         let inner = gaps.inner.unwrap_or_default();
         let inner_gaps = InnerGaps {
@@ -132,17 +140,33 @@ impl Config {
             },
         };
 
+        let sides = [
+            outer_gaps.left,
+            outer_gaps.top,
+            outer_gaps.right,
+            outer_gaps.bottom,
+            inner_gaps.horizontal,
+            inner_gaps.vertical,
+        ];
+        if sides.iter().any(|v| *v < 0) {
+            return Err(ConfigError("gaps: values must not be negative".into()));
+        }
+
         if !raw.mode.contains_key("main") {
             return Err(ConfigError("config must define [mode.main.binding]".into()));
         }
         let mut modes = BTreeMap::new();
         for (mode_name, raw_mode) in &raw.mode {
             let mut bindings = HashMap::new();
+            let mut written: HashMap<KeyChord, &str> = HashMap::new();
             for (key, commands) in &raw_mode.binding {
                 let at = |msg: &dyn fmt::Display| {
                     ConfigError(format!("mode.{mode_name}.binding.{key}: {msg}"))
                 };
                 let chord: KeyChord = key.parse().map_err(|e: String| at(&e))?;
+                if let Some(first) = written.insert(chord, key) {
+                    return Err(at(&format_args!("same key as {first}")));
+                }
                 let mut parsed = Vec::new();
                 for text in commands.as_slice() {
                     let command = parse_command(text).map_err(|e| at(&e))?;
@@ -170,6 +194,11 @@ impl Config {
             .into_iter()
             .map(|(workspace, pattern)| {
                 let pattern = match pattern {
+                    RawMonitorPattern::Index(0) => {
+                        return Err(ConfigError(format!(
+                            "workspace-to-monitor-force-assignment.{workspace}: monitor indexes start at 1"
+                        )))
+                    }
                     RawMonitorPattern::Index(i) => MonitorPattern::Index(i),
                     RawMonitorPattern::Name(n) if n == "main" => MonitorPattern::Main,
                     RawMonitorPattern::Name(n) if n == "secondary" => MonitorPattern::Secondary,
@@ -186,8 +215,9 @@ impl Config {
             .collect::<Result<_, ConfigError>>()?;
 
         Ok(Config {
+            start_at_login: raw.start_at_login.unwrap_or(false),
             hide_strategy,
-            accordion_padding: raw.accordion_padding.unwrap_or(30),
+            accordion_padding,
             default_root_layout,
             default_root_orientation,
             inner_gaps,
@@ -276,6 +306,7 @@ fn choice<T: Copy>(field: &str, value: &str, options: &[(&str, T)]) -> Result<T,
 #[derive(Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 struct RawConfig {
+    start_at_login: Option<bool>,
     hide_strategy: Option<String>,
     accordion_padding: Option<i32>,
     default_root_container_layout: Option<String>,
@@ -527,6 +558,38 @@ run = 'ignore'
         assert!(
             e.starts_with("on-window-detected[0].if.title-regex: "),
             "{e}"
+        );
+    }
+
+    #[test]
+    fn spec_example_keys_are_accepted() {
+        let c = Config::from_toml(&format!("start-at-login = true\n{MINIMAL}")).unwrap();
+        assert!(c.start_at_login);
+    }
+
+    #[test]
+    fn duplicate_chords_are_rejected() {
+        assert_eq!(
+            err("[mode.main.binding]\nalt-shift-h = 'focus left'\nshift-alt-h = 'focus right'\n"),
+            "mode.main.binding.shift-alt-h: same key as alt-shift-h"
+        );
+    }
+
+    #[test]
+    fn negative_sizes_and_zero_index_are_rejected() {
+        assert_eq!(
+            err(&format!("[gaps]\ninner.horizontal = -1\n{MINIMAL}")),
+            "gaps: values must not be negative"
+        );
+        assert_eq!(
+            err(&format!("accordion-padding = -5\n{MINIMAL}")),
+            "accordion-padding: must not be negative"
+        );
+        assert_eq!(
+            err(&format!(
+                "{MINIMAL}[workspace-to-monitor-force-assignment]\n1 = 0\n"
+            )),
+            "workspace-to-monitor-force-assignment.1: monitor indexes start at 1"
         );
     }
 

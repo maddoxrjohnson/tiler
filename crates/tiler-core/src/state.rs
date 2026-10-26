@@ -6,12 +6,12 @@
 //! number of window moves.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::LazyLock;
 
 use crate::command::{Command, LayoutArg, MonitorTarget};
 use crate::config::{Config, Mode, MonitorPattern, RuleAction};
 use crate::event::{Action, Event, Monitor, WindowInfo};
 use crate::geometry::{Direction, MonitorId, Orientation, Rect, WindowId};
-use crate::tree_ops::{ResizeAmount, ResizeDim};
 use crate::workspace::Workspace;
 
 /// Where a window should be.
@@ -48,7 +48,17 @@ pub struct State {
     applied: HashMap<WindowId, Placement>,
     /// Set when a command changed which window should have focus.
     focus_dirty: bool,
+    /// Set right after a window closed, minimized, or was sent to a hidden workspace.
+    /// Windows then activates some other window on its own; if that window is on a
+    /// hidden workspace, switching to it would surprise the user, so the next such
+    /// focus event is ignored. Any other focus event clears it.
+    suppress_hidden_focus: bool,
+    /// Workspaces shown on monitors that went away, keyed by monitor name and
+    /// position, so they come back when the monitor does (possibly with a new id).
+    departed: Vec<(String, (i32, i32), String)>,
 }
+
+static EMPTY_MODE: LazyLock<Mode> = LazyLock::new(Mode::default);
 
 impl State {
     pub fn new(config: Config) -> State {
@@ -64,6 +74,8 @@ impl State {
             prev_workspace: None,
             applied: HashMap::new(),
             focus_dirty: false,
+            suppress_hidden_focus: false,
+            departed: Vec::new(),
         }
     }
 
@@ -94,8 +106,8 @@ impl State {
                 self.config = *config;
                 if !self.config.modes.contains_key(&self.mode) {
                     self.mode = "main".into();
-                    out.push(Action::ModeChanged(self.mode.clone()));
                 }
+                out.push(Action::ModeChanged(self.mode.clone()));
             }
         }
         self.collect_garbage();
@@ -106,7 +118,7 @@ impl State {
 
     /// The bindings of the current mode, for the keyboard hook.
     pub fn bindings(&self) -> &Mode {
-        &self.config.modes[&self.mode]
+        self.config.modes.get(&self.mode).unwrap_or(&EMPTY_MODE)
     }
 
     pub fn mode(&self) -> &str {
@@ -153,10 +165,15 @@ impl State {
         let workspace = target
             .or_else(|| self.focused_workspace().map(str::to_owned))
             .unwrap_or_else(|| "1".into());
+        let shown_on = self.monitor_showing(&workspace);
+        if shown_on.is_none() {
+            self.suppress_hidden_focus = true;
+        }
+        let floating_rect = self.to_relative(info.rect, shown_on);
         self.windows.insert(
             id,
             Managed {
-                floating_rect: info.rect,
+                floating_rect,
                 info,
                 workspace,
                 floating,
@@ -173,12 +190,14 @@ impl State {
         if self.focused_window() == Some(id) {
             self.focus_dirty = true;
         }
+        self.suppress_hidden_focus = true;
         self.detach(id);
         self.windows.remove(&id);
         self.applied.remove(&id);
     }
 
     fn on_focused(&mut self, id: WindowId) {
+        let suppress = std::mem::take(&mut self.suppress_hidden_focus);
         let Some(w) = self.windows.get(&id) else {
             return;
         };
@@ -186,24 +205,33 @@ impl State {
             return;
         }
         let name = w.workspace.clone();
-        let monitor = match self.monitor_showing(&name) {
-            Some(m) => Some(m),
-            None => {
-                let last = self.workspaces[&name]
-                    .last_monitor
-                    .filter(|m| self.monitors.iter().any(|x| x.id == *m));
-                let target = last.or(self.focused_monitor);
-                if let Some(m) = target {
-                    self.prev_workspace = self.focused_workspace().map(str::to_owned);
-                    self.show_workspace(&name, m);
-                }
-                target
-            }
-        };
-        if monitor.is_some() {
-            self.focused_monitor = monitor;
+        if suppress && self.monitor_showing(&name).is_none() {
+            return;
+        }
+        if let Some(m) = self.reveal(&name) {
+            self.focused_monitor = Some(m);
         }
         self.workspace_mut(&name).touch(id);
+    }
+
+    /// Makes sure a workspace is on screen, preferring its pinned monitor, then the one
+    /// it was last on, then the focused one. Returns the monitor showing it.
+    fn reveal(&mut self, name: &str) -> Option<MonitorId> {
+        if let Some(m) = self.monitor_showing(name) {
+            return Some(m);
+        }
+        let last = self
+            .workspaces
+            .get(name)
+            .and_then(|ws| ws.last_monitor)
+            .filter(|m| self.monitor(*m).is_some());
+        let target = self
+            .forced_monitor(name)
+            .or(last)
+            .or(self.focused_monitor)?;
+        self.prev_workspace = self.focused_workspace().map(str::to_owned);
+        self.show_workspace(name, target);
+        Some(target)
     }
 
     fn on_minimized(&mut self, id: WindowId) {
@@ -213,6 +241,7 @@ impl State {
         self.detach(id);
         self.window_mut(id).minimized = true;
         self.applied.remove(&id);
+        self.suppress_hidden_focus = true;
     }
 
     fn on_restored(&mut self, id: WindowId) {
@@ -221,6 +250,10 @@ impl State {
         }
         self.window_mut(id).minimized = false;
         self.attach(id);
+        let name = self.windows[&id].workspace.clone();
+        if let Some(m) = self.reveal(&name) {
+            self.focused_monitor = Some(m);
+        }
     }
 
     fn on_move_size_end(&mut self, id: WindowId, rect: Rect) {
@@ -230,23 +263,32 @@ impl State {
         if w.minimized {
             return;
         }
+        let name = w.workspace.clone();
         if w.floating {
-            w.floating_rect = rect;
+            let relative = self.to_relative(rect, self.monitor_showing(&name));
+            self.window_mut(id).floating_rect = relative;
             self.applied.insert(id, Placement::At(rect));
             return;
         }
-        let name = w.workspace.clone();
         if let (Some(Placement::At(old)), Some(area)) =
             (self.applied.get(&id).copied(), self.workspace_area(&name))
         {
+            // Only a size change is a resize; a pure move snaps back below. Each edge
+            // that moved trades space with the neighbor on that side only.
+            let mut edges = Vec::new();
+            if rect.w != old.w {
+                edges.push((Direction::Left, old.x - rect.x));
+                edges.push((Direction::Right, rect.right() - old.right()));
+            }
+            if rect.h != old.h {
+                edges.push((Direction::Up, old.y - rect.y));
+                edges.push((Direction::Down, rect.bottom() - old.bottom()));
+            }
             let gaps = self.config.inner_gaps;
             let root = &mut self.workspace_mut(&name).root;
-            for (dim, delta) in [
-                (ResizeDim::Width, rect.w - old.w),
-                (ResizeDim::Height, rect.h - old.h),
-            ] {
+            for (side, delta) in edges {
                 if delta != 0 {
-                    root.resize(id, dim, ResizeAmount::Relative(delta), area, gaps);
+                    root.resize_edge(id, side, delta, area, gaps);
                 }
             }
         }
@@ -255,6 +297,19 @@ impl State {
     }
 
     fn on_monitors_changed(&mut self, mut monitors: Vec<Monitor>) {
+        let gone: Vec<Monitor> = self
+            .monitors
+            .iter()
+            .filter(|old| !monitors.iter().any(|m| m.id == old.id))
+            .cloned()
+            .collect();
+        for m in gone {
+            if let Some(ws) = self.visible.get(&m.id).cloned() {
+                let key = (m.name, (m.work_area.x, m.work_area.y));
+                self.departed.retain(|(n, p, _)| (n, p) != (&key.0, &key.1));
+                self.departed.push((key.0, key.1, ws));
+            }
+        }
         if monitors.is_empty() {
             // Displays are being reconfigured; keep everything until they return.
             self.monitors.clear();
@@ -274,10 +329,24 @@ impl State {
         }
         for id in ids {
             if !self.visible.contains_key(&id) {
-                let name = self.pick_workspace_for(id);
+                let name = match self.take_departed(id) {
+                    Some(name) => name,
+                    None => self.pick_workspace_for(id),
+                };
                 self.show_workspace(&name, id);
             }
         }
+    }
+
+    /// Takes the workspace that was on this monitor before it went away, if it is
+    /// still hidden.
+    fn take_departed(&mut self, monitor: MonitorId) -> Option<String> {
+        let m = self.monitor(monitor)?;
+        let key = (m.name.clone(), (m.work_area.x, m.work_area.y));
+        let i = self.departed.iter().position(|(n, p, ws)| {
+            (n, p) == (&key.0, &key.1) && !self.visible.values().any(|v| v == ws)
+        })?;
+        Some(self.departed.remove(i).2)
     }
 
     /// Chooses which workspace a monitor without one should show.
@@ -291,7 +360,11 @@ impl State {
         let previous = self
             .workspaces
             .iter()
-            .find(|(name, ws)| ws.last_monitor == Some(monitor) && hidden(name))
+            .find(|(name, ws)| {
+                ws.last_monitor == Some(monitor)
+                    && hidden(name)
+                    && self.forced_monitor(name).map_or(true, |f| f == monitor)
+            })
             .map(|(name, _)| name);
         if let Some(name) = forced.or(previous) {
             return name.clone();
@@ -396,6 +469,7 @@ impl State {
             Command::ReloadConfig => out.push(Action::ReloadConfig),
             Command::Rescue => out.push(Action::Rescue),
             Command::Quit => out.push(Action::Quit),
+            Command::DebugWindows => out.push(Action::DebugWindows),
             Command::ListWindows => out.push(Action::Reply(self.list_windows())),
             Command::ListWorkspaces { focused_only } => {
                 let names: Vec<&str> = if focused_only {
@@ -410,6 +484,16 @@ impl State {
     }
 
     fn focus_direction(&mut self, dir: Direction) {
+        // From a floating window, go back to the tiles of the same workspace first.
+        if let Some(id) = self.focused_window().filter(|id| self.windows[id].floating) {
+            let name = self.windows[&id].workspace.clone();
+            let ws = self.workspace_mut(&name);
+            if let Some(tiled) = ws.last_tiled() {
+                ws.touch(tiled);
+                self.focus_dirty = true;
+                return;
+            }
+        }
         if let Some((name, id)) = self.focused_tiled() {
             let ws = self.workspace_mut(&name);
             if let Some(next) = ws.root.neighbor(id, dir) {
@@ -455,8 +539,9 @@ impl State {
                         continue;
                     }
                     if want_floating {
-                        if let Some(Placement::At(r)) = self.applied.get(&id) {
-                            self.window_mut(id).floating_rect = *r;
+                        if let Some(Placement::At(r)) = self.applied.get(&id).copied() {
+                            let relative = self.to_relative(r, self.monitor_showing(&name));
+                            self.window_mut(id).floating_rect = relative;
                         }
                     }
                     self.detach(id);
@@ -658,6 +743,43 @@ impl State {
             .map(|(_, _, id)| id)
     }
 
+    /// Converts a screen rect to one relative to a monitor's work area: the given
+    /// monitor, else the one containing the rect's center, else the focused one.
+    fn to_relative(&self, rect: Rect, monitor: Option<MonitorId>) -> Rect {
+        let (cx, cy) = rect.center();
+        let contains = |m: &&Monitor| {
+            let a = m.work_area;
+            (a.x..a.right()).contains(&cx) && (a.y..a.bottom()).contains(&cy)
+        };
+        let m = monitor
+            .and_then(|id| self.monitor(id))
+            .or_else(|| self.monitors.iter().find(contains))
+            .or_else(|| self.focused_monitor.and_then(|id| self.monitor(id)));
+        match m {
+            Some(m) => Rect::new(
+                rect.x - m.work_area.x,
+                rect.y - m.work_area.y,
+                rect.w,
+                rect.h,
+            ),
+            None => rect,
+        }
+    }
+
+    /// Places a floating rect (relative to a work area) on a monitor, keeping it fully
+    /// on screen when it fits.
+    fn place_floating(relative: Rect, area: Rect) -> Rect {
+        let clamp = |pos: i32, size: i32, start: i32, len: i32| {
+            (start + pos).min(start + len - size).max(start)
+        };
+        Rect::new(
+            clamp(relative.x, relative.w, area.x, area.w),
+            clamp(relative.y, relative.h, area.y, area.h),
+            relative.w,
+            relative.h,
+        )
+    }
+
     /// Removes empty workspaces that are not on screen.
     fn collect_garbage(&mut self) {
         let visible: HashSet<&String> = self.visible.values().collect();
@@ -685,7 +807,8 @@ impl State {
                 out.insert(id, Placement::At(rect));
             }
             for id in &ws.floating {
-                out.insert(*id, Placement::At(self.windows[id].floating_rect));
+                let rect = Self::place_floating(self.windows[id].floating_rect, monitor.work_area);
+                out.insert(*id, Placement::At(rect));
             }
             if let Some(id) = ws.fullscreen {
                 out.insert(id, Placement::At(monitor.work_area));

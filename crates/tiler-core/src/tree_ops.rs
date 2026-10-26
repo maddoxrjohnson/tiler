@@ -53,6 +53,12 @@ pub enum ResizeAmount {
 /// A window never shrinks below this share of its container when resized.
 const MIN_SHARE: f64 = 1.0 / 20.0;
 
+/// The smallest size a child of a container with `n` children may be resized to.
+/// Never more than an equal share, so the bounds stay valid for any `n`.
+fn min_size(total: f64, n: usize) -> f64 {
+    (total * MIN_SHARE).min(total / n as f64)
+}
+
 /// The index next to `i` in `dir` within a container of `len` children.
 fn step(i: usize, dir: Direction, len: usize) -> Option<usize> {
     if dir.is_forward() {
@@ -247,14 +253,61 @@ impl Container {
             ResizeAmount::Relative(delta) => current + f64::from(delta),
             ResizeAmount::Absolute(size) => f64::from(size),
         };
-        let min = total * MIN_SHARE;
-        let target = target.clamp(min, total - min * (n - 1) as f64);
+        let min = min_size(total, n);
+        // `.max(min)` guards against rounding when every child is at an equal share.
+        let target = target.clamp(min, (total - min * (n - 1) as f64).max(min));
         let new = sum * target / total;
         let scale = (sum - new) / (sum - old);
         for (j, w) in parent.weights.iter_mut().enumerate() {
             *w = if j == i { new } else { *w * scale };
         }
         (new - old).abs() > f64::EPSILON
+    }
+
+    /// Moves one edge of a window by `delta` pixels (positive = outwards), taking the
+    /// space from (or giving it to) the neighbor on that side only. Used for mouse
+    /// resizing. Returns false if the window has no neighbor on that side.
+    pub fn resize_edge(
+        &mut self,
+        id: WindowId,
+        side: Direction,
+        delta: i32,
+        area: Rect,
+        gaps: InnerGaps,
+    ) -> bool {
+        let Some(path) = self.find(id) else {
+            return false;
+        };
+        for k in (0..path.len()).rev() {
+            let parent = self.container_at(&path[..k]);
+            if parent.orientation != side.orientation() || parent.layout != Layout::Tiles {
+                continue;
+            }
+            let i = path[k];
+            let n = parent.children.len();
+            let Some(j) = step(i, side, n) else {
+                continue;
+            };
+            let rect = self.container_rect(&path[..k], area, gaps);
+            let (gap, length) = match side.orientation() {
+                Orientation::H => (gaps.horizontal, rect.w),
+                Orientation::V => (gaps.vertical, rect.h),
+            };
+            let total = f64::from(length - gap * (n as i32 - 1));
+            if total <= 0.0 {
+                return false;
+            }
+            let parent = self.container_at_mut(&path[..k]);
+            let sum: f64 = parent.weights.iter().sum();
+            let (wi, wj) = (parent.weights[i], parent.weights[j]);
+            let pair = total * (wi + wj) / sum;
+            let min = min_size(total, n);
+            let new_i = (total * wi / sum + f64::from(delta)).clamp(min, (pair - min).max(min));
+            parent.weights[i] = sum * new_i / total;
+            parent.weights[j] = sum * (pair - new_i) / total;
+            return (parent.weights[i] - wi).abs() > f64::EPSILON;
+        }
+        false
     }
 
     /// The rectangle of the container at `path` when the tree fills `area`. Accordion
@@ -455,6 +508,61 @@ mod tests {
             area,
             InnerGaps::default()
         ));
+    }
+
+    #[test]
+    fn resize_with_more_than_twenty_children_does_not_panic() {
+        let mut t = root(h((1..=21).map(w).collect()));
+        let area = Rect::new(0, 0, 1904, 1064);
+        t.resize(
+            id(1),
+            ResizeDim::Width,
+            ResizeAmount::Relative(-50),
+            area,
+            InnerGaps::default(),
+        );
+        t.resize(
+            id(1),
+            ResizeDim::Width,
+            ResizeAmount::Relative(5000),
+            area,
+            InnerGaps::default(),
+        );
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn resize_edge_moves_only_that_edge() {
+        let mut t = root(h(vec![w(1), w(2), w(3)]));
+        let area = Rect::new(0, 0, 900, 500);
+        assert!(t.resize_edge(id(2), Left, 50, area, InnerGaps::default()));
+        let widths: Vec<i32> = t
+            .layout_rects(area, InnerGaps::default(), 0)
+            .iter()
+            .map(|(_, r)| r.w)
+            .collect();
+        assert_eq!(widths, vec![250, 350, 300]);
+        // Shrinking the right edge of 3 is impossible: it has no right neighbor.
+        assert!(!t.resize_edge(id(3), Right, -20, area, InnerGaps::default()));
+        // An edge can't push a neighbor below the minimum share.
+        t.resize_edge(id(2), Left, 10_000, area, InnerGaps::default());
+        let r = t.layout_rects(area, InnerGaps::default(), 0);
+        assert_eq!(r[0].1.w, 45);
+        t.check_invariants().unwrap();
+    }
+
+    #[test]
+    fn resize_edge_uses_nearest_matching_ancestor() {
+        // Window 2's top edge belongs to the V container; its left edge to the H root.
+        let mut t = fixture();
+        let area = Rect::new(0, 0, 1000, 1000);
+        assert!(t.resize_edge(id(3), Up, 100, area, InnerGaps::default()));
+        let r = t.layout_rects(area, InnerGaps::default(), 0);
+        assert_eq!(r[1].1.h, 400);
+        assert_eq!(r[2].1.h, 600);
+        assert!(t.resize_edge(id(3), Left, 100, area, InnerGaps::default()));
+        let r = t.layout_rects(area, InnerGaps::default(), 0);
+        assert_eq!(r[0].1.w, 400);
     }
 
     #[test]

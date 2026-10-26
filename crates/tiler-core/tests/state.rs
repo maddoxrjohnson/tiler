@@ -340,5 +340,155 @@ fn config_reload_applies_new_gaps() {
     h.open(1);
     let config = Config::from_toml("[mode.main.binding]\nalt-1 = 'workspace 1'\n").unwrap();
     let a = h.ev(Event::ConfigReloaded(Box::new(config)));
-    assert_eq!(a, vec![set_rect(1, SCREEN)]);
+    // ModeChanged is always sent so the keyboard hook refreshes its bindings.
+    assert_eq!(
+        a,
+        vec![set_rect(1, SCREEN), Action::ModeChanged("main".into())]
+    );
+}
+
+fn floating(rect: Rect) -> WindowInfo {
+    WindowInfo {
+        float_hint: true,
+        rect,
+        ..info("tool.exe")
+    }
+}
+
+#[test]
+fn floating_window_survives_monitor_removal() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.cmd("focus-monitor next");
+    let a = h.ev(Event::WindowAppeared(
+        WindowId(5),
+        floating(Rect::new(2200, 100, 800, 600)),
+    ));
+    assert_eq!(a, vec![set_rect(5, Rect::new(2200, 100, 800, 600))]);
+    h.ev(Event::MonitorsChanged(vec![monitor(1, 0)]));
+    let a = h.cmd("workspace 2");
+    assert!(
+        a.contains(&set_rect(5, Rect::new(280, 100, 800, 600))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn floating_window_follows_its_workspace_to_another_monitor() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.ev(Event::WindowAppeared(
+        WindowId(5),
+        floating(Rect::new(100, 100, 800, 600)),
+    ));
+    let a = h.cmd("move-workspace-to-monitor next");
+    assert!(
+        a.contains(&set_rect(5, Rect::new(2020, 100, 800, 600))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn floating_window_is_kept_on_screen() {
+    let mut h = Harness::single();
+    let a = h.ev(Event::WindowAppeared(
+        WindowId(5),
+        floating(Rect::new(1700, 100, 800, 600)),
+    ));
+    assert_eq!(a, vec![set_rect(5, Rect::new(1120, 100, 800, 600))]);
+}
+
+#[test]
+fn restoring_a_window_on_a_hidden_workspace_reveals_it() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.ev(Event::WindowMinimized(WindowId(1)));
+    h.cmd("workspace 2");
+    let a = h.ev(Event::WindowRestored(WindowId(1)));
+    assert_eq!(a, vec![set_rect(1, FULL)]);
+    assert_eq!(reply(&h.cmd("list-workspaces --focused")), "1");
+}
+
+#[test]
+fn automatic_focus_after_a_rule_hides_a_window_is_ignored_once() {
+    let config = Config::from_toml(
+        "[mode.main.binding]\nalt-1 = 'workspace 1'\n\
+         [[on-window-detected]]\nif.process = 'chat.exe'\nrun = 'move-node-to-workspace 9'\n",
+    )
+    .unwrap();
+    let mut h = Harness::new(config, vec![monitor(1, 0)]);
+    h.open(1);
+    assert_eq!(
+        h.ev(Event::WindowAppeared(WindowId(2), info("chat.exe"))),
+        vec![Action::Hide(WindowId(2))]
+    );
+    // Windows activates the new window on its own: stay on workspace 1.
+    assert!(h.ev(Event::WindowFocused(WindowId(2))).is_empty());
+    // A later, deliberate focus (Alt-Tab, taskbar) does switch.
+    h.ev(Event::WindowFocused(WindowId(1)));
+    let a = h.ev(Event::WindowFocused(WindowId(2)));
+    assert!(a.contains(&Action::Show(WindowId(2))));
+}
+
+#[test]
+fn automatic_focus_after_closing_a_window_is_ignored_once() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.cmd("workspace 2");
+    h.open(2);
+    let a = h.ev(Event::WindowDestroyed(WindowId(2)));
+    assert_eq!(a, vec![Action::Focus(None)]);
+    // Windows activates the next window in z-order, which is hidden: ignore it.
+    assert!(h.ev(Event::WindowFocused(WindowId(1))).is_empty());
+}
+
+#[test]
+fn drag_resize_moves_only_the_dragged_edge() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.open(2);
+    h.open(3);
+    // 3 tiles in 1904 px with two 8 px gaps: widths 629, 630, 629.
+    let dragged = Rect::new(645 - 46, 8, 630 + 46, 1064);
+    let a = h.ev(Event::WindowMoveSizeEnd(WindowId(2), dragged));
+    assert_eq!(
+        a,
+        vec![
+            set_rect(1, Rect::new(8, 8, 583, 1064)),
+            set_rect(2, Rect::new(599, 8, 676, 1064)),
+        ]
+    );
+}
+
+#[test]
+fn returning_monitor_shows_the_workspace_it_had() {
+    let mut h = Harness::new(Config::default(), vec![monitor(1, 0), monitor(2, 1920)]);
+    h.cmd("focus-monitor next");
+    h.open(1);
+    h.cmd("workspace 3");
+    h.open(2);
+    h.ev(Event::MonitorsChanged(vec![monitor(1, 0)]));
+    // Windows may give the monitor a new id when it comes back.
+    let mut back = monitor(2, 1920);
+    back.id = MonitorId(7);
+    let a = h.ev(Event::MonitorsChanged(vec![monitor(1, 0), back]));
+    assert!(
+        a.contains(&set_rect(2, Rect::new(1928, 8, 1904, 1064))),
+        "{a:?}"
+    );
+}
+
+#[test]
+fn focus_from_a_floating_window_goes_to_the_tiles() {
+    let mut h = Harness::single();
+    h.open(1);
+    h.ev(Event::WindowAppeared(
+        WindowId(2),
+        floating(Rect::new(100, 100, 400, 300)),
+    ));
+    assert_eq!(h.cmd("focus left"), vec![Action::Focus(Some(WindowId(1)))]);
+}
+
+#[test]
+fn debug_windows_is_passed_to_the_platform() {
+    let mut h = Harness::single();
+    assert_eq!(h.cmd("debug-windows"), vec![Action::DebugWindows]);
 }

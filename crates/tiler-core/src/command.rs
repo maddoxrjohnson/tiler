@@ -37,6 +37,8 @@ pub enum Command {
         focused_only: bool,
     },
     ListMonitors,
+    /// Dump everything the platform knows about every window, for bug reports.
+    DebugWindows,
     Quit,
 }
 
@@ -87,6 +89,7 @@ pub const COMMAND_NAMES: &[&str] = &[
     "list-windows",
     "list-workspaces",
     "list-monitors",
+    "debug-windows",
     "quit",
 ];
 
@@ -128,18 +131,18 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, ParseError> {
         "flatten-workspace-tree" => Command::FlattenWorkspaceTree,
         "close" => Command::Close,
         "fullscreen" => Command::Fullscreen,
-        "workspace" => Command::Workspace(args.word()?),
+        "workspace" => Command::Workspace(args.name()?),
         "workspace-back-and-forth" => Command::WorkspaceBackAndForth,
         "move-node-to-workspace" => {
             let focus_follows = args.flag("--focus-follows-window");
             Command::MoveNodeToWorkspace {
-                name: args.word()?,
+                name: args.name()?,
                 focus_follows,
             }
         }
         "move-workspace-to-monitor" => Command::MoveWorkspaceToMonitor(args.monitor()?),
         "focus-monitor" => Command::FocusMonitor(args.monitor()?),
-        "mode" => Command::Mode(args.word()?),
+        "mode" => Command::Mode(args.name()?),
         "reload-config" => Command::ReloadConfig,
         "rescue" => Command::Rescue,
         "list-windows" => Command::ListWindows,
@@ -147,6 +150,7 @@ pub fn parse_args<S: AsRef<str>>(args: &[S]) -> Result<Command, ParseError> {
             focused_only: args.flag("--focused"),
         },
         "list-monitors" => Command::ListMonitors,
+        "debug-windows" => Command::DebugWindows,
         "quit" => Command::Quit,
         _ => {
             return Err(ParseError(match suggest(name) {
@@ -175,6 +179,15 @@ impl<'a> Args<'a> {
             return Err(self.error("missing argument"));
         }
         Ok(self.rest.remove(0).to_string())
+    }
+
+    /// A workspace or mode name.
+    fn name(&mut self) -> Result<String, ParseError> {
+        let name = self.word()?;
+        if name.is_empty() {
+            return Err(self.error("name cannot be empty"));
+        }
+        Ok(name)
     }
 
     /// Removes `flag` from anywhere in the arguments, returning whether it was present.
@@ -445,6 +458,21 @@ mod tests {
         assert_eq!(err("close now"), "close: unexpected argument 'now'");
         assert_eq!(err(""), "empty command");
         assert_eq!(err("workspace 'oops"), "unterminated quote");
+    }
+
+    #[test]
+    fn names_must_not_be_empty() {
+        assert_eq!(err("workspace ''"), "workspace: name cannot be empty");
+        assert_eq!(
+            err("move-node-to-workspace \"\""),
+            "move-node-to-workspace: name cannot be empty"
+        );
+        assert_eq!(err("mode ''"), "mode: name cannot be empty");
+    }
+
+    #[test]
+    fn debug_windows() {
+        assert_eq!(ok("debug-windows"), Command::DebugWindows);
     }
 
     #[test]

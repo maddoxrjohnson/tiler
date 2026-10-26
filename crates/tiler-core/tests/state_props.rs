@@ -53,7 +53,7 @@ fn monitors() -> impl Strategy<Value = Vec<Monitor>> {
 }
 
 fn event() -> impl Strategy<Value = Event> {
-    let id = (0u64..10).prop_map(WindowId);
+    let id = (0u64..25).prop_map(WindowId);
     let rect = (0i32..3000, 0i32..1500, 1i32..2000, 1i32..1200)
         .prop_map(|(x, y, w, h)| Rect::new(x, y, w, h));
     prop_oneof![
