@@ -49,9 +49,30 @@ pub fn appeared(id: WindowId, facts: Option<WindowFacts>, we_are_elevated: bool)
         .then(|| Event::WindowAppeared(id, window_info(&f)))
 }
 
-/// Translates one raw event. `facts` is only called when needed, since reading
-/// window facts costs several system calls.
+/// Translates one raw event into zero or more core events. `facts` is only called
+/// when needed, since reading window facts costs several system calls.
 pub fn translate(
+    kind: Kind,
+    id: WindowId,
+    cx: &Context,
+    facts: impl FnOnce() -> Option<WindowFacts>,
+) -> Vec<Event> {
+    match kind {
+        // Some windows only become manageable after they are shown (their title or
+        // style is set later), so give unmanaged windows another chance when they
+        // gain focus or change title.
+        Kind::Foreground if !cx.managed => appeared(id, facts(), cx.we_are_elevated)
+            .into_iter()
+            .chain([Event::WindowFocused(id)])
+            .collect(),
+        Kind::NameChange if !cx.managed => appeared(id, facts(), cx.we_are_elevated)
+            .into_iter()
+            .collect(),
+        _ => translate_one(kind, id, cx, facts).into_iter().collect(),
+    }
+}
+
+fn translate_one(
     kind: Kind,
     id: WindowId,
     cx: &Context,
@@ -103,19 +124,24 @@ mod tests {
         }
     }
 
-    fn name(e: Option<Event>) -> String {
-        match e {
-            None => "none".into(),
-            Some(e) => format!("{e:?}").split('(').next().unwrap().to_owned(),
+    fn name(events: Vec<Event>) -> String {
+        if events.is_empty() {
+            return "none".into();
         }
+        events
+            .iter()
+            .map(|e| format!("{e:?}").split('(').next().unwrap().to_owned())
+            .collect::<Vec<_>>()
+            .join("+")
     }
 
     #[test]
     fn new_window_appears_with_its_info() {
         let e = translate(Kind::Show, ID, &cx(false), || Some(app()));
-        let Some(Event::WindowAppeared(id, info)) = e else {
+        let [Event::WindowAppeared(id, info)] = e.as_slice() else {
             panic!("{e:?}")
         };
+        let id = *id;
         assert_eq!(id, ID);
         assert_eq!(info.app_name, "notepad");
         assert!(!info.float_hint);
@@ -177,13 +203,42 @@ mod tests {
             name(translate(Kind::Foreground, ID, &cx(false), || None)),
             "WindowFocused"
         );
+        assert_eq!(
+            name(translate(Kind::Foreground, ID, &cx(true), || panic!(
+                "facts read"
+            ))),
+            "WindowFocused"
+        );
+    }
+
+    #[test]
+    fn late_manageable_windows_are_adopted_on_focus_or_title_change() {
+        assert_eq!(
+            name(translate(Kind::Foreground, ID, &cx(false), || Some(app()))),
+            "WindowAppeared+WindowFocused"
+        );
+        assert_eq!(
+            name(translate(Kind::NameChange, ID, &cx(false), || Some(app()))),
+            "WindowAppeared"
+        );
+        let untitled = WindowFacts {
+            title: String::new(),
+            style: 0,
+            ..app()
+        };
+        assert_eq!(
+            name(translate(Kind::NameChange, ID, &cx(false), || Some(
+                untitled
+            ))),
+            "none"
+        );
     }
 
     #[test]
     fn mouse_resize_reports_the_visible_rect() {
         let e = translate(Kind::MoveSizeEnd, ID, &cx(true), || Some(app()));
         assert!(
-            matches!(e, Some(Event::WindowMoveSizeEnd(_, r)) if r == Rect::new(10, 10, 800, 600))
+            matches!(e.as_slice(), [Event::WindowMoveSizeEnd(_, r)] if *r == Rect::new(10, 10, 800, 600))
         );
     }
 }

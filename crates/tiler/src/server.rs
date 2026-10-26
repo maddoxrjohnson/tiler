@@ -11,7 +11,7 @@ use tiler_windows::win::apply::{self, HideStrategy, OffscreenHide};
 use tiler_windows::win::hook::{self, RawEvent};
 use tiler_windows::win::keyboard::{self, Bindings};
 use tiler_windows::win::rescue;
-use tiler_windows::win::{monitors, window, Hwnd};
+use tiler_windows::win::{display, monitors, window, Hwnd};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -27,6 +27,9 @@ use crate::ServerOptions;
 /// How long to wait before placing a just-unmaximized window again, once its
 /// normal (not maximized) borders can be measured.
 const REPLACE_DELAY: Duration = Duration::from_millis(150);
+
+/// How long display change messages must stop before the monitors are re-read.
+const DISPLAY_SETTLE: Duration = Duration::from_millis(300);
 
 fn kind(event: u32) -> Option<Kind> {
     Some(match event {
@@ -71,6 +74,12 @@ struct Server {
     config_explicit: bool,
     /// Windows that were maximized when placed, with their target rect.
     replace_soon: HashMap<Hwnd, Rect>,
+    /// Windows just placed, to check whether they accepted the size.
+    verify_soon: HashMap<Hwnd, Rect>,
+    /// When to re-place `replace_soon` and check `verify_soon`.
+    timer_at: Option<Instant>,
+    /// When to re-read the monitors, after a burst of display change messages.
+    display_at: Option<Instant>,
     /// The chords the keyboard hook swallows: the current mode's bindings.
     bindings: Bindings,
     /// Replies and errors produced while handling the current CLI request.
@@ -121,8 +130,12 @@ impl Server {
                 if apply::is_maximized(hwnd) {
                     apply::unmaximize(hwnd);
                     self.replace_soon.insert(hwnd, rect);
+                } else {
+                    self.verify_soon.insert(hwnd, rect);
                 }
                 apply::set_rect(hwnd, rect);
+                self.timer_at
+                    .get_or_insert_with(|| Instant::now() + REPLACE_DELAY);
             }
             Action::Hide(id) => self.hide.hide(Hwnd::from_id(id), &self.monitors),
             Action::Show(id) => self.hide.show(Hwnd::from_id(id)),
@@ -210,10 +223,56 @@ impl Server {
         )
     }
 
-    /// Places windows that were maximized again, now that they are restored.
-    fn replace_unmaximized(&mut self) {
-        for (hwnd, rect) in std::mem::take(&mut self.replace_soon) {
-            apply::set_rect(hwnd, rect);
+    /// Runs the delayed work whose time has come.
+    fn run_timers(&mut self) {
+        let now = Instant::now();
+        if self.timer_at.is_some_and(|t| t <= now) {
+            self.timer_at = None;
+            self.verify_sizes();
+            // Windows that were maximized are restored by now: place them again with
+            // their normal borders, and check their size after that.
+            for (hwnd, rect) in std::mem::take(&mut self.replace_soon) {
+                apply::set_rect(hwnd, rect);
+                self.verify_soon.insert(hwnd, rect);
+                self.timer_at = Some(now + REPLACE_DELAY);
+            }
+        }
+        if self.display_at.is_some_and(|t| t <= now) {
+            self.display_at = None;
+            tracing::info!("monitor setup changed");
+            self.dispatch(Event::MonitorsChanged(monitors::monitors()));
+            // The parking spot depends on the monitor layout; a new monitor could
+            // now be showing parked windows.
+            for hwnd in self.hide.hidden() {
+                self.hide.hide(hwnd, &self.monitors);
+            }
+        }
+    }
+
+    /// The next time `run_timers` has something to do.
+    fn next_timer(&self) -> Option<Instant> {
+        match (self.timer_at, self.display_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    /// Reports windows that ended up bigger than asked: apps with a minimum size.
+    fn verify_sizes(&mut self) {
+        for (hwnd, asked) in std::mem::take(&mut self.verify_soon) {
+            if self.hide.is_hidden(hwnd) {
+                continue;
+            }
+            let Some(actual) = window::visible_rect(hwnd) else {
+                continue;
+            };
+            // A few pixels of slack: some apps round their size.
+            let w = if actual.w > asked.w + 4 { actual.w } else { 0 };
+            let h = if actual.h > asked.h + 4 { actual.h } else { 0 };
+            if w > 0 || h > 0 {
+                tracing::debug!(?hwnd, w, h, "window has a minimum size");
+                self.dispatch(Event::WindowMinSize(hwnd.id(), w, h));
+            }
         }
     }
 
@@ -227,10 +286,11 @@ impl Server {
             hidden_by_us: self.hide.emits_hide_events() && self.hide.is_hidden(raw.hwnd),
             we_are_elevated: self.we_are_elevated,
         };
-        match translate::translate(kind, id, &cx, || window::facts(raw.hwnd)) {
-            Some(event) => self.dispatch(event),
-            None => true,
+        let mut keep_running = true;
+        for event in translate::translate(kind, id, &cx, || window::facts(raw.hwnd)) {
+            keep_running &= self.dispatch(event);
         }
+        keep_running
     }
 }
 
@@ -292,6 +352,9 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         config_path,
         config_explicit,
         replace_soon: HashMap::new(),
+        verify_soon: HashMap::new(),
+        timer_at: None,
+        display_at: None,
         bindings: Bindings::default(),
         output: Vec::new(),
     };
@@ -325,6 +388,8 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     } else {
         keyboard::spawn_keyboard_hook(server.bindings.clone(), hotkey_tx);
     }
+    let (display_tx, display_rx) = unbounded();
+    display::spawn_display_listener(display_tx);
     let (config_tx, config_rx) = unbounded();
     if let Some(path) = server.config_path.clone() {
         watch::spawn_config_watcher(path, config_tx);
@@ -333,11 +398,12 @@ pub fn run(opts: ServerOptions) -> ExitCode {
 
     let mut quit_reply = None;
     loop {
-        let timeout = if server.replace_soon.is_empty() {
-            Duration::from_secs(3600)
-        } else {
-            REPLACE_DELAY
-        };
+        // Run due timers on every iteration: a steady stream of events would
+        // otherwise keep the `default` arm below from ever firing.
+        server.run_timers();
+        let timeout = server.next_timer().map_or(Duration::from_secs(3600), |t| {
+            t.saturating_duration_since(Instant::now())
+        });
         select! {
             recv(raw_rx) -> raw => match raw {
                 Ok(raw) => if !server.on_raw(raw) { break },
@@ -366,8 +432,12 @@ pub fn run(opts: ServerOptions) -> ExitCode {
                 Err(_) => break,
             },
             recv(config_rx) -> _ => server.reload_config(),
+            recv(display_rx) -> _ => {
+                // Displays change in bursts; wait until they settle.
+                server.display_at = Some(Instant::now() + DISPLAY_SETTLE);
+            }
             recv(stop_rx) -> _ => break,
-            default(timeout) => server.replace_unmaximized(),
+            default(timeout) => server.run_timers(),
         }
     }
 

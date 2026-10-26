@@ -2,6 +2,7 @@
 //! made in the platform-independent modules and in `tiler-core`.
 
 pub mod apply;
+pub mod display;
 pub mod hook;
 pub mod identity;
 pub mod keyboard;

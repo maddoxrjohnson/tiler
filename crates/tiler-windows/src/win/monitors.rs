@@ -8,9 +8,20 @@ use windows::Win32::Foundation::{LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW,
 };
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::MONITORINFOF_PRIMARY;
 
 use super::window::rect_from;
+
+/// The monitor's DPI scale factor (1.0 at 96 DPI).
+fn scale(hmon: HMONITOR) -> f32 {
+    let (mut x, mut y) = (96u32, 96u32);
+    // SAFETY: valid monitor handle and out pointers.
+    match unsafe { GetDpiForMonitor(hmon, MDT_EFFECTIVE_DPI, &mut x, &mut y) } {
+        Ok(()) => x as f32 / 96.0,
+        Err(_) => 1.0,
+    }
+}
 
 /// Every monitor with its work area (the screen minus the taskbar).
 pub fn monitors() -> Vec<Monitor> {
@@ -32,7 +43,7 @@ pub fn monitors() -> Vec<Monitor> {
                 id: MonitorId(hmon.0 as usize as u64),
                 bounds: rect_from(info.monitorInfo.rcMonitor),
                 work_area: rect_from(info.monitorInfo.rcWork),
-                scale: 1.0,
+                scale: scale(hmon),
                 name: String::from_utf16_lossy(&info.szDevice[..name_len]),
                 primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             });
