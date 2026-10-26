@@ -265,15 +265,27 @@ impl Container {
     }
 
     /// Computes the rectangle of every window when the tree fills `area`.
+    /// Like [`layout_rects`](Self::layout_rects), but every window gets at least its
+    /// minimum `(width, height)` when the space allows it.
+    pub fn layout_rects_with(
+        &self,
+        area: Rect,
+        gaps: InnerGaps,
+        accordion_padding: i32,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> Vec<(WindowId, Rect)> {
+        let mut out = Vec::new();
+        self.layout_into(area, gaps, accordion_padding, min, &mut out);
+        out
+    }
+
     pub fn layout_rects(
         &self,
         area: Rect,
         gaps: InnerGaps,
         accordion_padding: i32,
     ) -> Vec<(WindowId, Rect)> {
-        let mut out = Vec::new();
-        self.layout_into(area, gaps, accordion_padding, &mut out);
-        out
+        self.layout_rects_with(area, gaps, accordion_padding, &|_| (0, 0))
     }
 
     fn layout_into(
@@ -281,19 +293,99 @@ impl Container {
         area: Rect,
         gaps: InnerGaps,
         padding: i32,
+        min: &dyn Fn(WindowId) -> (i32, i32),
         out: &mut Vec<(WindowId, Rect)>,
     ) {
-        let rects = self.child_rects(area, gaps, padding);
+        let rects = self.child_rects_with(area, gaps, padding, min);
         for (child, rect) in self.children.iter().zip(rects) {
             match child {
                 Node::Window(id) => out.push((*id, rect)),
-                Node::Container(c) => c.layout_into(rect, gaps, padding, out),
+                Node::Container(c) => c.layout_into(rect, gaps, padding, min, out),
+            }
+        }
+    }
+
+    /// The smallest size of a node along `axis`, given each window's minimum.
+    fn min_along(
+        node: &Node,
+        axis: Orientation,
+        gaps: InnerGaps,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> i32 {
+        match node {
+            Node::Window(id) => {
+                let (w, h) = min(*id);
+                match axis {
+                    Orientation::H => w,
+                    Orientation::V => h,
+                }
+            }
+            Node::Container(c) => {
+                let mins = c
+                    .children
+                    .iter()
+                    .map(|n| Self::min_along(n, axis, gaps, min));
+                if c.orientation == axis && c.layout == Layout::Tiles {
+                    let gap = match axis {
+                        Orientation::H => gaps.horizontal,
+                        Orientation::V => gaps.vertical,
+                    };
+                    mins.sum::<i32>() + gap * (c.children.len() as i32 - 1).max(0)
+                } else {
+                    mins.max().unwrap_or(0)
+                }
+            }
+        }
+    }
+
+    /// Sizes for tiles children: weighted shares, but no child below its minimum.
+    /// Children whose share is too small are fixed at their minimum and the rest is
+    /// shared again by weight. If even the minimums don't fit, they are scaled down
+    /// proportionally.
+    fn tile_sizes(&self, avail: f64, mins: &[f64]) -> Vec<f64> {
+        let total_min: f64 = mins.iter().sum();
+        if total_min >= avail {
+            return if total_min > 0.0 {
+                mins.iter().map(|m| avail * m / total_min).collect()
+            } else {
+                vec![0.0; mins.len()]
+            };
+        }
+        let mut fixed = vec![false; mins.len()];
+        loop {
+            let used: f64 = (0..mins.len()).filter(|&i| fixed[i]).map(|i| mins[i]).sum();
+            let weight: f64 = (0..mins.len())
+                .filter(|&i| !fixed[i])
+                .map(|i| self.weights[i])
+                .sum();
+            let free = avail - used;
+            let share = |i: usize| free * self.weights[i] / weight;
+            let short: Vec<usize> = (0..mins.len())
+                .filter(|&i| !fixed[i] && share(i) < mins[i])
+                .collect();
+            if short.is_empty() {
+                return (0..mins.len())
+                    .map(|i| if fixed[i] { mins[i] } else { share(i) })
+                    .collect();
+            }
+            for i in short {
+                fixed[i] = true;
             }
         }
     }
 
     /// The rectangles of this container's direct children when it fills `area`.
     pub(crate) fn child_rects(&self, area: Rect, gaps: InnerGaps, padding: i32) -> Vec<Rect> {
+        self.child_rects_with(area, gaps, padding, &|_| (0, 0))
+    }
+
+    fn child_rects_with(
+        &self,
+        area: Rect,
+        gaps: InnerGaps,
+        padding: i32,
+        min: &dyn Fn(WindowId) -> (i32, i32),
+    ) -> Vec<Rect> {
         let n = self.children.len();
         if n == 0 {
             return Vec::new();
@@ -306,18 +398,23 @@ impl Container {
                     Orientation::V => (gaps.vertical, area.h),
                 };
                 let avail = (total - gap * last as i32).max(0);
-                let sum: f64 = self.weights.iter().sum();
+                let mins: Vec<f64> = self
+                    .children
+                    .iter()
+                    .map(|c| f64::from(Self::min_along(c, self.orientation, gaps, min)))
+                    .collect();
+                let sizes = self.tile_sizes(f64::from(avail), &mins);
                 let mut cumulative = 0.0;
                 let mut start = 0;
                 (0..n)
                     .map(|i| {
-                        cumulative += self.weights[i];
+                        cumulative += sizes[i];
                         // Rounding cumulative edges spreads leftover pixels evenly and
                         // guarantees the children exactly fill the available space.
                         let end = if i == last {
                             avail
                         } else {
-                            (f64::from(avail) * cumulative / sum).round() as i32
+                            cumulative.round() as i32
                         };
                         let offset = start + gap * i as i32;
                         let size = end - start;
@@ -531,6 +628,58 @@ mod tests {
                 (WindowId(3), Rect::new(30, 0, 970, 500)),
             ]
         );
+    }
+
+    fn widths_with(t: &Container, w: i32, mins: &[(u64, i32, i32)]) -> Vec<i32> {
+        let min = |id: WindowId| {
+            mins.iter()
+                .find(|(m, _, _)| *m == id.0)
+                .map_or((0, 0), |(_, w, h)| (*w, *h))
+        };
+        t.layout_rects_with(Rect::new(0, 0, w, 1000), InnerGaps::default(), 30, &min)
+            .iter()
+            .map(|(_, r)| r.w)
+            .collect()
+    }
+
+    #[test]
+    fn minimum_width_is_honored_and_the_rest_shrinks() {
+        let t = root(h(vec![w(1), w(2)]));
+        assert_eq!(widths_with(&t, 1000, &[(1, 700, 0)]), vec![700, 300]);
+        // A minimum below the weighted share changes nothing.
+        assert_eq!(widths_with(&t, 1000, &[(1, 300, 0)]), vec![500, 500]);
+    }
+
+    #[test]
+    fn remaining_space_is_shared_by_weight() {
+        let mut t = root(h(vec![w(1), w(2), w(3)]));
+        t.weights = vec![1.0, 1.0, 3.0];
+        // 1 needs 600; the other 600 px go 1:3 to windows 2 and 3.
+        assert_eq!(widths_with(&t, 1200, &[(1, 600, 0)]), vec![600, 150, 450]);
+    }
+
+    #[test]
+    fn impossible_minimums_are_scaled_proportionally() {
+        let t = root(h(vec![w(1), w(2)]));
+        assert_eq!(
+            widths_with(&t, 1000, &[(1, 700, 0), (2, 400, 0)]),
+            vec![636, 364]
+        );
+    }
+
+    #[test]
+    fn nested_minimums_propagate_to_the_container() {
+        // V[2 3] must be as wide as its widest child.
+        let t = root(h(vec![w(1), v(vec![w(2), w(3)])]));
+        assert_eq!(widths_with(&t, 1000, &[(2, 600, 0)]), vec![400, 600, 600]);
+        // Heights inside V are untouched by width minimums.
+        let r = t.layout_rects_with(
+            Rect::new(0, 0, 1000, 1000),
+            InnerGaps::default(),
+            30,
+            &|id: WindowId| if id.0 == 3 { (0, 800) } else { (0, 0) },
+        );
+        assert_eq!((r[1].1.h, r[2].1.h), (200, 800));
     }
 
     #[test]

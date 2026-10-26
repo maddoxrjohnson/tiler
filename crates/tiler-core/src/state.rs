@@ -11,7 +11,8 @@ use std::sync::LazyLock;
 use crate::command::{Command, LayoutArg, MonitorTarget};
 use crate::config::{Config, Mode, MonitorPattern, RuleAction};
 use crate::event::{Action, Event, Monitor, WindowInfo};
-use crate::geometry::{Direction, MonitorId, Orientation, Rect, WindowId};
+use crate::geometry::{Direction, MonitorId, Orientation, Rect, Sides, WindowId};
+use crate::tree::InnerGaps;
 use crate::workspace::Workspace;
 
 /// Where a window should be.
@@ -53,6 +54,8 @@ pub struct State {
     /// hidden workspace, switching to it would surprise the user, so the next such
     /// focus event is ignored. Any other focus event clears it.
     suppress_hidden_focus: bool,
+    /// Sizes below which a window refuses to shrink, as reported by the platform.
+    min_size: HashMap<WindowId, (i32, i32)>,
     /// Workspaces shown on monitors that went away, keyed by monitor name and
     /// position, so they come back when the monitor does (possibly with a new id).
     departed: Vec<(String, (i32, i32), String)>,
@@ -75,6 +78,7 @@ impl State {
             applied: HashMap::new(),
             focus_dirty: false,
             suppress_hidden_focus: false,
+            min_size: HashMap::new(),
             departed: Vec::new(),
         }
     }
@@ -92,6 +96,12 @@ impl State {
             Event::WindowTitleChanged(id, title) => {
                 if let Some(w) = self.windows.get_mut(&id) {
                     w.info.title = title;
+                }
+            }
+            Event::WindowMinSize(id, w, h) => {
+                if self.windows.contains_key(&id) {
+                    let min = self.min_size.entry(id).or_default();
+                    *min = (min.0.max(w), min.1.max(h));
                 }
             }
             Event::MonitorsChanged(monitors) => self.on_monitors_changed(monitors),
@@ -194,6 +204,7 @@ impl State {
         self.detach(id);
         self.windows.remove(&id);
         self.applied.remove(&id);
+        self.min_size.remove(&id);
     }
 
     fn on_focused(&mut self, id: WindowId) {
@@ -264,11 +275,42 @@ impl State {
             return;
         }
         let name = w.workspace.clone();
-        if w.floating {
+        let floating = w.floating;
+
+        // Dropped on another monitor: the window moves to the workspace shown there.
+        let (cx, cy) = rect.center();
+        let dropped_on = self
+            .monitors
+            .iter()
+            .find(|m| {
+                let a = m.bounds;
+                (a.x..a.right()).contains(&cx) && (a.y..a.bottom()).contains(&cy)
+            })
+            .map(|m| m.id);
+        if let Some(m) = dropped_on.filter(|m| Some(*m) != self.monitor_showing(&name)) {
+            if let Some(target) = self.visible.get(&m).cloned() {
+                self.move_node(id, &target);
+                self.focused_monitor = Some(m);
+                if floating {
+                    self.window_mut(id).floating_rect = self.to_relative(rect, Some(m));
+                    self.applied.insert(id, Placement::At(rect));
+                } else {
+                    self.applied.remove(&id);
+                }
+                return;
+            }
+        }
+
+        if floating {
             let relative = self.to_relative(rect, self.monitor_showing(&name));
             self.window_mut(id).floating_rect = relative;
             self.applied.insert(id, Placement::At(rect));
             return;
+        }
+        // The user made the window smaller than its recorded minimum, so the
+        // minimum was too high.
+        if let Some(min) = self.min_size.get_mut(&id) {
+            *min = (min.0.min(rect.w), min.1.min(rect.h));
         }
         if let (Some(Placement::At(old)), Some(area)) =
             (self.applied.get(&id).copied(), self.workspace_area(&name))
@@ -284,7 +326,7 @@ impl State {
                 edges.push((Direction::Up, old.y - rect.y));
                 edges.push((Direction::Down, rect.bottom() - old.bottom()));
             }
-            let gaps = self.config.inner_gaps;
+            let gaps = self.workspace_gaps(&name);
             let root = &mut self.workspace_mut(&name).root;
             for (side, delta) in edges {
                 if delta != 0 {
@@ -395,7 +437,7 @@ impl State {
             Command::Resize(dim, amount) => {
                 if let Some((name, id)) = self.focused_tiled() {
                     if let Some(area) = self.workspace_area(&name) {
-                        let gaps = self.config.inner_gaps;
+                        let gaps = self.workspace_gaps(&name);
                         self.workspace_mut(&name)
                             .root
                             .resize(id, dim, amount, area, gaps);
@@ -643,7 +685,35 @@ impl State {
     /// The area windows of a workspace are tiled into, if it is visible.
     fn workspace_area(&self, name: &str) -> Option<Rect> {
         let m = self.monitor(self.monitor_showing(name)?)?;
-        Some(m.work_area.inset(self.config.outer_gaps))
+        Some(m.work_area.inset(self.scaled_gaps(m).0))
+    }
+
+    /// The inner gaps of the monitor showing a workspace.
+    fn workspace_gaps(&self, name: &str) -> InnerGaps {
+        self.monitor_showing(name)
+            .and_then(|m| self.monitor(m))
+            .map_or(self.config.inner_gaps, |m| self.scaled_gaps(m).1)
+    }
+
+    /// Outer gaps, inner gaps and accordion padding for a monitor, scaled by its DPI
+    /// so they look the same size on every monitor.
+    fn scaled_gaps(&self, m: &Monitor) -> (Sides, InnerGaps, i32) {
+        let s = |v: i32| (v as f32 * m.scale).round() as i32;
+        let o = self.config.outer_gaps;
+        let i = self.config.inner_gaps;
+        (
+            Sides {
+                left: s(o.left),
+                top: s(o.top),
+                right: s(o.right),
+                bottom: s(o.bottom),
+            },
+            InnerGaps {
+                horizontal: s(i.horizontal),
+                vertical: s(i.vertical),
+            },
+            s(self.config.accordion_padding),
+        )
     }
 
     /// Shows a workspace on a monitor, replacing whatever that monitor showed.
@@ -799,10 +869,10 @@ impl State {
                 }
                 continue;
             };
-            let area = monitor.work_area.inset(self.config.outer_gaps);
-            let tiled =
-                ws.root
-                    .layout_rects(area, self.config.inner_gaps, self.config.accordion_padding);
+            let (outer, inner, padding) = self.scaled_gaps(monitor);
+            let area = monitor.work_area.inset(outer);
+            let min = |id: WindowId| self.min_size.get(&id).copied().unwrap_or((0, 0));
+            let tiled = ws.root.layout_rects_with(area, inner, padding, &min);
             for (id, rect) in tiled {
                 out.insert(id, Placement::At(rect));
             }

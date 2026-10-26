@@ -32,6 +32,7 @@ pub fn monitors() -> Vec<Monitor> {
                 id: MonitorId(hmon.0 as usize as u64),
                 bounds: rect_from(info.monitorInfo.rcMonitor),
                 work_area: rect_from(info.monitorInfo.rcWork),
+                scale: 1.0,
                 name: String::from_utf16_lossy(&info.szDevice[..name_len]),
                 primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,
             });
