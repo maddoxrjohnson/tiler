@@ -26,6 +26,9 @@ pub struct WindowInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Monitor {
     pub id: MonitorId,
+    /// The whole display.
+    pub bounds: Rect,
+    /// The display minus the taskbar and other app bars.
     pub work_area: Rect,
     pub name: String,
     pub primary: bool,

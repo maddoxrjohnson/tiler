@@ -136,12 +136,11 @@ impl Drop for OwnedHandle {
     }
 }
 
-fn token_elevated(process: HANDLE) -> bool {
+/// Whether a process's token is elevated, or `None` if we cannot tell.
+fn token_elevated(process: HANDLE) -> Option<bool> {
     let mut token = HANDLE::default();
     // SAFETY: valid process handle and out pointer.
-    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.is_err() {
-        return false;
-    }
+    unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) }.ok()?;
     let token = OwnedHandle(token);
     let mut elevation = TOKEN_ELEVATION::default();
     let mut len = 0u32;
@@ -155,13 +154,14 @@ fn token_elevated(process: HANDLE) -> bool {
             &mut len,
         )
     };
-    ok.is_ok() && elevation.TokenIsElevated != 0
+    ok.ok()?;
+    Some(elevation.TokenIsElevated != 0)
 }
 
 /// Whether this process runs as administrator.
 pub fn is_process_elevated() -> bool {
     // SAFETY: GetCurrentProcess returns a pseudo-handle that needs no closing.
-    token_elevated(unsafe { GetCurrentProcess() })
+    token_elevated(unsafe { GetCurrentProcess() }).unwrap_or(false)
 }
 
 /// Executable name and elevation of the process that owns a window. Processes we
@@ -175,7 +175,7 @@ fn process_info(hwnd: Hwnd) -> (String, bool) {
         return (String::new(), true);
     };
     let handle = OwnedHandle(handle);
-    let mut buf = [0u16; 1024];
+    let mut buf = [0u16; 32_768];
     let mut len = buf.len() as u32;
     // SAFETY: buf is valid for `len` u16s.
     let path = match unsafe {
@@ -190,7 +190,12 @@ fn process_info(hwnd: Hwnd) -> (String, bool) {
         Err(_) => String::new(),
     };
     let exe = path.rsplit('\\').next().unwrap_or_default().to_owned();
-    (exe, token_elevated(handle.0))
+    if exe.is_empty() {
+        tracing::debug!(?hwnd, "could not read the process image name");
+    }
+    // A token we may not open usually belongs to an elevated process; assume so,
+    // since managing an elevated window would silently fail (UIPI).
+    (exe, token_elevated(handle.0).unwrap_or(true))
 }
 
 /// Everything the heuristics need, or `None` if the window is gone.

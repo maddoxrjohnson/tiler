@@ -30,6 +30,7 @@ pub fn monitors() -> Vec<Monitor> {
             let name_len = info.szDevice.iter().position(|c| *c == 0).unwrap_or(32);
             list.push(Monitor {
                 id: MonitorId(hmon.0 as usize as u64),
+                bounds: rect_from(info.monitorInfo.rcMonitor),
                 work_area: rect_from(info.monitorInfo.rcWork),
                 name: String::from_utf16_lossy(&info.szDevice[..name_len]),
                 primary: info.monitorInfo.dwFlags & MONITORINFOF_PRIMARY != 0,

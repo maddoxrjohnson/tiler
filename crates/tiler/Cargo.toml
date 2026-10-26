@@ -12,13 +12,17 @@ rust-version.workspace = true
 tiler-core = { path = "../tiler-core" }
 tiler-windows = { path = "../tiler-windows" }
 crossbeam-channel = "0.5"
-ctrlc = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [target.'cfg(windows)'.dependencies.windows]
 version = "0.62"
-features = ["Win32_Foundation", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"]
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]
 
 [lints]
 workspace = true

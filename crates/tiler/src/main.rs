@@ -3,6 +3,8 @@
 mod translate;
 
 #[cfg(windows)]
+mod console;
+#[cfg(windows)]
 mod server;
 
 use std::path::PathBuf;
