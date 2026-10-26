@@ -8,6 +8,7 @@ pub mod identity;
 pub mod keyboard;
 pub mod monitors;
 pub mod rescue;
+pub mod startup;
 pub mod window;
 
 pub use window::Hwnd;

@@ -42,6 +42,14 @@ pub fn window_info(f: &WindowFacts) -> WindowInfo {
     }
 }
 
+/// A Store (UWP) app frame whose app window isn't attached yet, so it still reports
+/// the generic host process. Adopting it now would make rules miss it; its title
+/// change or focus a moment later adopts it with the real process.
+fn unresolved_uwp_frame(f: &WindowFacts) -> bool {
+    f.class == "ApplicationFrameWindow"
+        && f.process.eq_ignore_ascii_case("ApplicationFrameHost.exe")
+}
+
 /// A window that should start being managed, if `facts` says so.
 pub fn appeared(id: WindowId, facts: Option<WindowFacts>, we_are_elevated: bool) -> Option<Event> {
     let f = facts?;
@@ -79,9 +87,11 @@ fn translate_one(
     facts: impl FnOnce() -> Option<WindowFacts>,
 ) -> Option<Event> {
     match kind {
-        Kind::Show | Kind::Uncloaked | Kind::MinimizeEnd if !cx.managed => {
-            appeared(id, facts(), cx.we_are_elevated)
-        }
+        Kind::Show | Kind::Uncloaked | Kind::MinimizeEnd if !cx.managed => appeared(
+            id,
+            facts().filter(|f| !unresolved_uwp_frame(f)),
+            cx.we_are_elevated,
+        ),
         Kind::Show | Kind::Uncloaked => None,
         // An app that hides its own window (e.g. "close to tray") is treated as closed.
         Kind::Hide if cx.managed && !cx.hidden_by_us => Some(Event::WindowDestroyed(id)),
@@ -208,6 +218,46 @@ mod tests {
                 "facts read"
             ))),
             "WindowFocused"
+        );
+    }
+
+    fn uwp_frame() -> WindowFacts {
+        WindowFacts {
+            class: "ApplicationFrameWindow".into(),
+            process: "ApplicationFrameHost.exe".into(),
+            ..app()
+        }
+    }
+
+    #[test]
+    fn uwp_frames_wait_for_the_app_before_being_adopted() {
+        // Shown before the app's own window is attached: the process would be the
+        // generic host, so rules couldn't match. Wait.
+        assert_eq!(
+            name(translate(Kind::Show, ID, &cx(false), || Some(uwp_frame()))),
+            "none"
+        );
+        assert_eq!(
+            name(translate(Kind::Uncloaked, ID, &cx(false), || Some(
+                uwp_frame()
+            ))),
+            "none"
+        );
+        // Once the app is attached, the real process is reported and it's adopted.
+        let ready = WindowFacts {
+            process: "CalculatorApp.exe".into(),
+            ..uwp_frame()
+        };
+        assert_eq!(
+            name(translate(Kind::NameChange, ID, &cx(false), || Some(ready))),
+            "WindowAppeared"
+        );
+        // If it never resolves, focusing it still adopts it.
+        assert_eq!(
+            name(translate(Kind::Foreground, ID, &cx(false), || Some(
+                uwp_frame()
+            ))),
+            "WindowAppeared+WindowFocused"
         );
     }
 

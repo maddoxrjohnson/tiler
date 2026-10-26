@@ -14,9 +14,9 @@ use windows::Win32::System::Threading::{
     PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowPlacement, GetWindowRect,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE,
-    GW_OWNER, WINDOWPLACEMENT,
+    EnumChildWindows, EnumWindows, GetClassNameW, GetWindow, GetWindowLongW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GWL_EXSTYLE, GWL_STYLE, GW_OWNER, WINDOWPLACEMENT,
 };
 
 use crate::facts::WindowFacts;
@@ -210,6 +210,34 @@ fn process_info(hwnd: Hwnd) -> (String, bool) {
     (exe, token_elevated(handle.0).unwrap_or(true))
 }
 
+fn process_id(hwnd: Hwnd) -> u32 {
+    let mut pid = 0u32;
+    // SAFETY: valid out pointer.
+    unsafe { GetWindowThreadProcessId(hwnd.raw(), Some(&mut pid)) };
+    pid
+}
+
+/// The child window of a UWP frame that belongs to the hosted app's process.
+fn uwp_app_window(frame: Hwnd) -> Option<Hwnd> {
+    unsafe extern "system" fn collect(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        // SAFETY: lparam is the &mut Vec passed below, alive for the whole call.
+        let list = unsafe { &mut *(lparam.0 as *mut Vec<Hwnd>) };
+        list.push(hwnd.into());
+        true.into()
+    }
+    let mut children: Vec<Hwnd> = Vec::new();
+    // SAFETY: the callback only touches `children`, which outlives the call.
+    let _ = unsafe {
+        EnumChildWindows(
+            Some(frame.raw()),
+            Some(collect),
+            LPARAM(&mut children as *mut _ as isize),
+        )
+    };
+    let frame_pid = process_id(frame);
+    children.into_iter().find(|c| process_id(*c) != frame_pid)
+}
+
 /// Everything the heuristics need, or `None` if the window is gone or invisible.
 /// Invisible windows are rejected first because they are common and the process
 /// lookup below costs several system calls.
@@ -230,7 +258,21 @@ pub fn facts(hwnd: Hwnd) -> Option<WindowFacts> {
             IsIconic(h).as_bool(),
         )
     };
-    let (process, elevated) = process_info(hwnd);
+    let class_name = class(hwnd);
+    // Store (UWP) apps live in a frame window owned by ApplicationFrameHost.exe;
+    // the app's own process owns a child window. Use that, so rules can tell
+    // Calculator from Settings.
+    let (process, elevated) = match (class_name == "ApplicationFrameWindow")
+        .then(|| uwp_app_window(hwnd))
+        .flatten()
+    {
+        // If the app's process can't be read, the frame's own is better than
+        // nothing (an empty name would also be treated as elevated).
+        Some(child) => Some(process_info(child))
+            .filter(|(exe, _)| !exe.is_empty())
+            .unwrap_or_else(|| process_info(hwnd)),
+        None => process_info(hwnd),
+    };
     Some(WindowFacts {
         style,
         ex_style,
@@ -238,7 +280,7 @@ pub fn facts(hwnd: Hwnd) -> Option<WindowFacts> {
         visible,
         cloaked: is_cloaked(hwnd),
         minimized,
-        class: class(hwnd),
+        class: class_name,
         title: title(hwnd),
         process,
         elevated,

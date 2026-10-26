@@ -10,16 +10,14 @@ use tiler_core::{parse_args, Action, Config, Event, Monitor, Rect, State};
 use tiler_windows::win::apply::{self, HideStrategy, OffscreenHide};
 use tiler_windows::win::hook::{self, RawEvent};
 use tiler_windows::win::keyboard::{self, Bindings};
-use tiler_windows::win::rescue;
 use tiler_windows::win::{display, monitors, window, Hwnd};
-use windows::Win32::UI::HiDpi::{
-    SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
-};
+use tiler_windows::win::{rescue, startup};
 use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 
 use crate::console;
 use crate::ipc::{Request, Response};
 use crate::pipe;
+use crate::recovery::{self, Parked, RecoveryFile};
 use crate::translate::{self, Context, Kind};
 use crate::watch;
 use crate::ServerOptions;
@@ -88,6 +86,12 @@ struct Server {
     verify_soon: HashMap<Hwnd, Verify>,
     /// When to re-read the monitors, after a burst of display change messages.
     display_at: Option<Instant>,
+    /// Where each hidden (or about to be hidden) window was, and its executable.
+    parked_rects: HashMap<Hwnd, (Rect, String)>,
+    /// What the recovery file currently says.
+    saved_parked: Vec<Parked>,
+    /// `None` in a dry run, which never parks anything.
+    recovery_path: Option<PathBuf>,
     /// The chords the keyboard hook swallows: the current mode's bindings.
     bindings: Bindings,
     /// Replies and errors produced while handling the current CLI request.
@@ -103,16 +107,73 @@ impl Server {
             // The core forgets these windows' placement without emitting Show.
             Event::WindowDestroyed(id) | Event::WindowMinimized(id) => {
                 self.hide.forget(Hwnd::from_id(*id));
+                self.parked_rects.remove(&Hwnd::from_id(*id));
             }
             _ => {}
         }
         tracing::debug!(?event, "event");
         let actions = self.state.handle(event);
+        // Record windows about to be hidden before any of them moves, so a crash
+        // or kill in between can never leave a parked window out of the record.
+        if !self.dry_run {
+            for action in &actions {
+                if let Action::Hide(id) = action {
+                    self.remember_before_hiding(Hwnd::from_id(*id));
+                }
+            }
+            self.save_recovery();
+        }
         let mut keep_running = true;
         for action in actions {
             keep_running &= self.execute(action);
         }
+        self.save_recovery();
         keep_running
+    }
+
+    /// Notes where a window is and which app owns it, just before hiding it.
+    fn remember_before_hiding(&mut self, hwnd: Hwnd) {
+        if self.parked_rects.contains_key(&hwnd) {
+            return;
+        }
+        if let Some(f) = window::facts(hwnd) {
+            self.parked_rects.insert(hwnd, (f.rect, f.process));
+        }
+    }
+
+    /// Writes the recovery file (and the panic hook's copy) when the set of parked
+    /// windows changed.
+    fn save_recovery(&mut self) {
+        let mut parked: Vec<Parked> = self
+            .parked_rects
+            .iter()
+            .map(|(h, (r, exe))| Parked {
+                hwnd: h.0 as i64,
+                rect: [r.x, r.y, r.w, r.h],
+                exe: exe.clone(),
+            })
+            .collect();
+        parked.sort_by_key(|p| p.hwnd);
+        if parked == self.saved_parked {
+            return;
+        }
+        recovery::restore::mirror(&parked);
+        if let Some(path) = &self.recovery_path {
+            let file = RecoveryFile {
+                pid: std::process::id(),
+                parked: parked.clone(),
+            };
+            let result = if parked.is_empty() {
+                recovery::remove(path);
+                Ok(())
+            } else {
+                recovery::save(path, &file)
+            };
+            if let Err(e) = result {
+                tracing::warn!(%e, "could not write the recovery file");
+            }
+        }
+        self.saved_parked = parked;
     }
 
     fn execute(&mut self, action: Action) -> bool {
@@ -153,7 +214,11 @@ impl Server {
                 apply::set_rect(hwnd, rect);
             }
             Action::Hide(id) => self.hide.hide(Hwnd::from_id(id), &self.monitors),
-            Action::Show(id) => self.hide.show(Hwnd::from_id(id)),
+            Action::Show(id) => {
+                let hwnd = Hwnd::from_id(id);
+                self.hide.show(hwnd);
+                self.parked_rects.remove(&hwnd);
+            }
             Action::Focus(id) => apply::focus(id.map(Hwnd::from_id)),
             Action::Close(id) => apply::close(Hwnd::from_id(id)),
             Action::Reply(text) => tracing::info!("{text}"),
@@ -172,19 +237,35 @@ impl Server {
         true
     }
 
+    fn apply_start_at_login(&self) {
+        if self.dry_run {
+            return;
+        }
+        // Start in the background (no console window), with the same config file.
+        let mut args = String::from("server --background");
+        if self.config_explicit {
+            if let Some(path) = &self.config_path {
+                let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+                args.push_str(&format!(" --config \"{}\"", path.display()));
+            }
+        }
+        startup::set_start_at_login(self.state.config().start_at_login, &args);
+    }
+
     fn reload_config(&mut self) {
         match load_config(self.config_path.as_ref(), self.config_explicit) {
             Ok(config) => {
                 tracing::info!("config reloaded");
                 self.dispatch(Event::ConfigReloaded(Box::new(config)));
+                self.apply_start_at_login();
             }
             Err(e) => tracing::error!("config not reloaded: {e}"),
         }
     }
 
-    /// Brings every window tiler hid back onto the primary monitor.
+    /// Puts every window tiler hid back where it was when it was hidden.
     fn restore_hidden(&mut self) {
-        let area = self
+        let fallback = self
             .monitors
             .iter()
             .find(|m| m.primary)
@@ -192,11 +273,25 @@ impl Server {
             .map(|m| m.work_area);
         for hwnd in self.hide.hidden() {
             self.hide.show(hwnd);
-            if let (Some(area), Some(r)) = (area, window::visible_rect(hwnd)) {
-                let rect = Rect::new(area.x + 40, area.y + 40, r.w.min(area.w), r.h.min(area.h));
-                let _ = apply::restore_to(hwnd, rect);
+            match self.parked_rects.remove(&hwnd) {
+                Some((r, exe)) => {
+                    let p = Parked {
+                        hwnd: hwnd.0 as i64,
+                        rect: [r.x, r.y, r.w, r.h],
+                        exe,
+                    };
+                    recovery::restore::restore_ours(&[p]);
+                }
+                None => {
+                    if let (Some(a), Some(r)) = (fallback, window::visible_rect(hwnd)) {
+                        let rect = Rect::new(a.x + 40, a.y + 40, r.w.min(a.w), r.h.min(a.h));
+                        let _ = apply::restore_to_queued(hwnd, rect);
+                    }
+                }
             }
         }
+        self.parked_rects.clear();
+        self.save_recovery();
     }
 
     fn refresh_bindings(&mut self) {
@@ -373,20 +468,23 @@ fn debug_windows() {
 }
 
 pub fn run(opts: ServerOptions) -> ExitCode {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("TILER_LOG")
-                .unwrap_or_else(|_| "info".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    // SAFETY: called once at startup, before any window is created.
-    if let Err(e) =
-        unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) }
-    {
-        tracing::warn!(%e, "could not enable per-monitor DPI awareness");
+    if opts.background {
+        // Started at login: let go of the console window that Windows opened.
+        // SAFETY: plain call; logging already goes to a file.
+        let _ = unsafe { windows::Win32::System::Console::FreeConsole() };
     }
+
+    // If tiler panics, put parked windows back before the process goes away.
+    let default_hook = std::panic::take_hook();
+    // Only the main thread's panic ends the server; a worker thread's panic must
+    // not bring hidden windows back while the server keeps running.
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().name() == Some("main") {
+            let restored = recovery::restore::restore_mirrored();
+            eprintln!("tiler crashed; restored {restored} hidden window(s)");
+        }
+        default_hook(info);
+    }));
 
     let config_explicit = opts.config.is_some();
     let config_path = opts.config.clone().or_else(default_config_path);
@@ -422,10 +520,18 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         replace_soon: HashMap::new(),
         verify_soon: HashMap::new(),
         display_at: None,
+        parked_rects: HashMap::new(),
+        saved_parked: Vec::new(),
+        recovery_path: if opts.dry_run {
+            None
+        } else {
+            recovery::default_path()
+        },
         bindings: Bindings::default(),
         output: Vec::new(),
     };
     server.refresh_bindings();
+    server.apply_start_at_login();
     if server.dry_run {
         tracing::info!("dry run: no window will be moved");
     }
@@ -435,6 +541,14 @@ pub fn run(opts: ServerOptions) -> ExitCode {
     // between is not missed. The core ignores duplicate appearances.
     let (raw_tx, raw_rx) = unbounded();
     hook::spawn_event_hook(raw_tx);
+
+    // A previous server that crashed or was killed may have left windows parked.
+    if let Some(path) = &server.recovery_path {
+        let restored = recovery::restore::from_file(path);
+        if restored > 0 {
+            tracing::info!(restored, "restored windows left hidden by a previous run");
+        }
+    }
 
     server.dispatch(Event::MonitorsChanged(monitors::monitors()));
     // Adopt existing windows bottom-to-top so the topmost one ends up focused.
@@ -456,7 +570,9 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         keyboard::spawn_keyboard_hook(server.bindings.clone(), hotkey_tx);
     }
     let (display_tx, display_rx) = unbounded();
-    display::spawn_display_listener(display_tx);
+    let (session_tx, session_rx) = unbounded();
+    let (session_done_tx, session_done_rx) = unbounded();
+    display::spawn_display_listener(display_tx, session_tx, session_done_rx);
     let (config_tx, config_rx) = unbounded();
     if let Some(path) = server.config_path.clone() {
         watch::spawn_config_watcher(path, config_tx);
@@ -504,6 +620,10 @@ pub fn run(opts: ServerOptions) -> ExitCode {
                 server.display_at = Some(Instant::now() + DISPLAY_SETTLE);
             }
             recv(stop_rx) -> _ => break,
+            recv(session_rx) -> _ => {
+                tracing::info!("Windows is logging off or shutting down");
+                break;
+            }
             default(timeout) => server.run_timers(),
         }
     }
@@ -517,6 +637,10 @@ pub fn run(opts: ServerOptions) -> ExitCode {
         // Let the pipe thread deliver the reply before the process exits.
         let _ = written.recv_timeout(Duration::from_secs(2));
     }
+    if let Some(path) = &server.recovery_path {
+        recovery::remove(path);
+    }
     let _ = cleanup_done.send(());
+    let _ = session_done_tx.send(());
     ExitCode::SUCCESS
 }

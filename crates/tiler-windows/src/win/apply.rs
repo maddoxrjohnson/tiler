@@ -122,6 +122,17 @@ pub fn set_rect(hwnd: Hwnd, visible: Rect) {
 /// position would otherwise still be the off-screen parking spot. Returns whether
 /// Windows accepted the change.
 pub fn restore_to(hwnd: Hwnd, visible: Rect) -> bool {
+    restore_with(hwnd, visible, false)
+}
+
+/// Like [`restore_to`], but a normal window's move is queued like every other
+/// tiler move, so it can't overtake a hide the app hasn't processed yet, and a
+/// hung app can't block the caller.
+pub fn restore_to_queued(hwnd: Hwnd, visible: Rect) -> bool {
+    restore_with(hwnd, visible, true)
+}
+
+fn restore_with(hwnd: Hwnd, visible: Rect, queued: bool) -> bool {
     // SAFETY: plain queries.
     let (minimized, maximized) = unsafe {
         (
@@ -131,20 +142,15 @@ pub fn restore_to(hwnd: Hwnd, visible: Rect) -> bool {
     };
     if !minimized && !maximized {
         let r = outer_rect(visible, window::borders(hwnd));
-        // SAFETY: synchronous here so the result says whether it worked; rescue is
-        // rare and user-initiated.
-        return unsafe {
-            SetWindowPos(
-                hwnd.raw(),
-                None,
-                r.x,
-                r.y,
-                r.w,
-                r.h,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            )
-        }
-        .is_ok();
+        // Synchronous unless queued, so the result says whether it worked; rescue
+        // is rare and user-initiated.
+        let flags = if queued {
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS
+        } else {
+            SWP_NOZORDER | SWP_NOACTIVATE
+        };
+        // SAFETY: plain window-management call.
+        return unsafe { SetWindowPos(hwnd.raw(), None, r.x, r.y, r.w, r.h, flags) }.is_ok();
     }
     let mut wp = WINDOWPLACEMENT {
         length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
