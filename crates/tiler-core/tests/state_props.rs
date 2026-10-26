@@ -44,6 +44,7 @@ fn monitors() -> impl Strategy<Value = Vec<Monitor>> {
         (0..n)
             .map(|i| Monitor {
                 id: MonitorId(i as u64 + 1),
+                bounds: Rect::new(i as i32 * 1920, 0, 1920, 1080),
                 work_area: Rect::new(i as i32 * 1920, 0, 1920, if i == 2 { 1920 } else { 1080 }),
                 name: format!("M{i}"),
                 primary: i == 0,

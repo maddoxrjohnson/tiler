@@ -1,0 +1,28 @@
+[package]
+name = "tiler"
+description = "A keyboard-driven tiling window manager for Windows, inspired by AeroSpace"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tiler-core = { path = "../tiler-core" }
+tiler-windows = { path = "../tiler-windows" }
+crossbeam-channel = "0.5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.62"
+features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_HiDpi",
+    "Win32_UI_WindowsAndMessaging",
+]
+
+[lints]
+workspace = true

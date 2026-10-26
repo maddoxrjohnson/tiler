@@ -13,6 +13,7 @@ const RIGHT: Rect = Rect::new(964, 8, 948, 1064);
 fn monitor(id: u64, x: i32) -> Monitor {
     Monitor {
         id: MonitorId(id),
+        bounds: Rect::new(x, 0, 1920, 1080),
         work_area: Rect::new(x, 0, 1920, 1080),
         name: format!("Monitor {id}"),
         primary: id == 1,
