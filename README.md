@@ -8,6 +8,8 @@ tiler arranges your windows into an i3-style tree of rows and columns, gives you
 instant virtual workspaces, and is driven entirely by keyboard shortcuts or a
 command-line tool. Configuration is one plain-text TOML file.
 
+![tiler tiling, moving, resizing and floating windows and switching workspaces](docs/demo.gif)
+
 > **Status:** early (pre-1.0). It is in daily use by its author, but expect rough
 > edges. If a window ever goes missing, `tiler rescue` brings it back.
 
@@ -172,6 +174,12 @@ cargo run -- --dry-run                                # log what tiler would do,
 
 `tiler-core` builds and tests on Linux and macOS as well. CI runs formatting,
 Clippy and tests on Ubuntu and Windows.
+
+The demo above is a real screen recording of tiler, captioned with
+[Remotion](https://www.remotion.dev). `demo/scripts/record.ps1` drives tiler through
+its CLI over demo windows and logs when each command runs; `demo/` turns that into
+the video with the matching shortcut on screen (`npm run render:gif` /
+`npm run render:mp4`).
 
 Before a release, the manual smoke test is: tile three windows; switch workspaces
 and back; Alt-Tab to a window on a hidden workspace; resize with the mouse and the
