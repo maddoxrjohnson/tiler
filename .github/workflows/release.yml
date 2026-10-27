@@ -1,14 +1,16 @@
-name: Release
+name: Release build
+
+# Builds and tests the release zip when a v* tag is pushed. The GitHub release
+# itself is created by the maintainer (gh release create), so it is published
+# under their account rather than the github-actions bot.
 
 on:
   push:
     tags: ["v*"]
-
-permissions:
-  contents: write
+  workflow_dispatch:
 
 jobs:
-  release:
+  build:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
@@ -23,10 +25,7 @@ jobs:
           Copy-Item target\release\tiler.exe, README.md, LICENSE $name
           Copy-Item crates\tiler-core\src\default-config.toml "$name\tiler.example.toml"
           Compress-Archive $name "$name.zip"
-      - name: Publish
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          gh release create "${{ github.ref_name }}" "tiler-${{ github.ref_name }}-x86_64-windows.zip" `
-            --title "tiler ${{ github.ref_name }}" --generate-notes
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tiler-${{ github.ref_name }}-x86_64-windows
+          path: tiler-${{ github.ref_name }}-x86_64-windows.zip

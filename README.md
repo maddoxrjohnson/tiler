@@ -181,6 +181,10 @@ its CLI over demo windows and logs when each command runs; `demo/` turns that in
 the video with the matching shortcut on screen (`npm run render:gif` /
 `npm run render:mp4`).
 
+To release: push a `v*` tag; the *Release build* workflow tests and packages
+`tiler.exe` as a build artifact. Then publish it with
+`gh release create vX.Y.Z tiler-vX.Y.Z-x86_64-windows.zip`.
+
 Before a release, the manual smoke test is: tile three windows; switch workspaces
 and back; Alt-Tab to a window on a hidden workspace; resize with the mouse and the
 keyboard; float and unfloat a dialog; kill the server and run `tiler rescue`; quit.
