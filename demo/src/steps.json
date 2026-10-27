@@ -1,0 +1,85 @@
+{
+  "clipEnd": 54.76,
+  "steps": [
+    {
+      "at": 2.01,
+      "keys": "",
+      "caption": "New windows tile automatically"
+    },
+    {
+      "at": 12.6,
+      "keys": "alt-shift-h",
+      "caption": "Move a window"
+    },
+    {
+      "at": 15.14,
+      "keys": "alt-shift-j",
+      "caption": "Move it into a new row"
+    },
+    {
+      "at": 18.19,
+      "keys": "alt-equal",
+      "caption": "Resize"
+    },
+    {
+      "at": 20.74,
+      "keys": "alt-k",
+      "caption": "Move focus"
+    },
+    {
+      "at": 22.28,
+      "keys": "alt-comma",
+      "caption": "Accordion layout"
+    },
+    {
+      "at": 25.31,
+      "keys": "alt-slash",
+      "caption": "Back to tiles"
+    },
+    {
+      "at": 27.86,
+      "keys": "",
+      "caption": "Store apps work too"
+    },
+    {
+      "at": 31.39,
+      "keys": "alt-shift-space",
+      "caption": "Float a window"
+    },
+    {
+      "at": 34.44,
+      "keys": "alt-shift-6",
+      "caption": "Send it to workspace 6"
+    },
+    {
+      "at": 36.98,
+      "keys": "alt-6",
+      "caption": "Instant workspace switching"
+    },
+    {
+      "at": 39.57,
+      "keys": "alt-5",
+      "caption": "and back"
+    },
+    {
+      "at": 42.1,
+      "keys": "alt-f",
+      "caption": "Fullscreen"
+    },
+    {
+      "at": 44.64,
+      "keys": "alt-f",
+      "caption": "and back"
+    },
+    {
+      "at": 46.65,
+      "keys": "alt-shift-semicolon r",
+      "caption": "Flatten the layout"
+    },
+    {
+      "at": 49.22,
+      "keys": "alt-shift-semicolon b",
+      "caption": "Balance sizes"
+    }
+  ]
+}
